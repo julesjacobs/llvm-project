@@ -286,45 +286,50 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     if (IDHasAlloc(CSI.ID)) {
       int AllocSize = allocSizeOfID(CSI.ID);
 
-      if (AllocSize < 2) {
+      if (AllocSize == 0) {
+        // Poll frames are encoded like allocation frames with no allocation
+        // entries. This matches Dbg_alloc [] in OxCaml's normal backend.
+        OS.emitInt8(0);
+      } else if (AllocSize < 2) {
         report_fatal_error("[OxCamlGCPrinter] alloc size must at least be two!");
-      }
-
-      // Allocations can theoretically go up to 255 * 257 = 65535 words,
-      // but in practice comballoc never gives us allocations that exceed 255,
-      // so this handling isn't necessarily needed, but it's here just in case.
-
-      int MaxAllocSize = 257;
-
-      if (AllocSize % MaxAllocSize == 0) {
-        size_t NumAlloc = AllocSize / MaxAllocSize;
-        
-        OS.emitInt8(NumAlloc);
-        for (size_t i = 0; i < NumAlloc; ++i) {
-          OS.emitInt8(encodeAllocSize(MaxAllocSize));
-        }
-      } else if (AllocSize % MaxAllocSize == 1) {
-        // This is special since we cannot have allocations of size 1...
-        
-        // Guaranteed to be nonnegative
-        size_t NumMaxAlloc = AllocSize / MaxAllocSize - 1;
-        
-        OS.emitInt8(NumMaxAlloc + 2);
-        for (size_t i = 0; i < NumMaxAlloc; ++i) {
-          OS.emitInt8(encodeAllocSize(MaxAllocSize));
-        }
-        
-        OS.emitInt8(encodeAllocSize(MaxAllocSize - 1));
-        OS.emitInt8(encodeAllocSize(2));
       } else {
-        size_t NumMaxAlloc = AllocSize / MaxAllocSize;
-        
-        OS.emitInt8(NumMaxAlloc + 1);
-        for (size_t i = 0; i < NumMaxAlloc; ++i) {
-          OS.emitInt8(encodeAllocSize(MaxAllocSize));
+
+        // Allocations can theoretically go up to 255 * 257 = 65535 words,
+        // but in practice comballoc never gives us allocations that exceed 255,
+        // so this handling isn't necessarily needed, but it's here just in case.
+
+        int MaxAllocSize = 257;
+
+        if (AllocSize % MaxAllocSize == 0) {
+          size_t NumAlloc = AllocSize / MaxAllocSize;
+
+          OS.emitInt8(NumAlloc);
+          for (size_t i = 0; i < NumAlloc; ++i) {
+            OS.emitInt8(encodeAllocSize(MaxAllocSize));
+          }
+        } else if (AllocSize % MaxAllocSize == 1) {
+          // This is special since we cannot have allocations of size 1...
+
+          // Guaranteed to be nonnegative
+          size_t NumMaxAlloc = AllocSize / MaxAllocSize - 1;
+
+          OS.emitInt8(NumMaxAlloc + 2);
+          for (size_t i = 0; i < NumMaxAlloc; ++i) {
+            OS.emitInt8(encodeAllocSize(MaxAllocSize));
+          }
+
+          OS.emitInt8(encodeAllocSize(MaxAllocSize - 1));
+          OS.emitInt8(encodeAllocSize(2));
+        } else {
+          size_t NumMaxAlloc = AllocSize / MaxAllocSize;
+
+          OS.emitInt8(NumMaxAlloc + 1);
+          for (size_t i = 0; i < NumMaxAlloc; ++i) {
+            OS.emitInt8(encodeAllocSize(MaxAllocSize));
+          }
+
+          OS.emitInt8(encodeAllocSize(AllocSize % MaxAllocSize));
         }
-        
-        OS.emitInt8(encodeAllocSize(AllocSize % MaxAllocSize));
       }
     }
 
