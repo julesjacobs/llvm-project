@@ -216,6 +216,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InlineAsm.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCDwarf.h"
 #include "llvm/Support/CommandLine.h"
@@ -427,6 +428,12 @@ bool AArch64FrameLowering::canUseRedZone(const MachineFunction &MF) const {
 bool AArch64FrameLowering::hasFP(const MachineFunction &MF) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
   const TargetRegisterInfo *RegInfo = MF.getSubtarget().getRegisterInfo();
+  const CallingConv::ID CC = MF.getFunction().getCallingConv();
+  const bool IsOxCamlCallingConv =
+      CC == CallingConv::OxCaml_WithFP || CC == CallingConv::OxCaml_WithoutFP ||
+      CC == CallingConv::OxCaml_C_Call ||
+      CC == CallingConv::OxCaml_C_Call_StackArgs ||
+      CC == CallingConv::OxCaml_Alloc;
   // Win64 EH requires a frame pointer if funclets are present, as the locals
   // are accessed off the frame pointer in both the parent function and the
   // funclets.
@@ -436,7 +443,7 @@ bool AArch64FrameLowering::hasFP(const MachineFunction &MF) const {
   if (MF.getTarget().Options.DisableFramePointerElim(MF))
     return true;
   if (MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken() ||
-      MFI.hasStackMap() || MFI.hasPatchPoint() ||
+      (!IsOxCamlCallingConv && (MFI.hasStackMap() || MFI.hasPatchPoint())) ||
       RegInfo->hasStackRealignment(MF))
     return true;
   // With large callframes around we may need to use FP to access the scavenging
@@ -877,6 +884,47 @@ static bool windowsRequiresStackProbe(MachineFunction &MF,
          !F.hasFnAttribute("no-stack-arg-probe");
 }
 
+static bool needsOxCamlStackCheck(const MachineFunction &MF) {
+  return MF.getFunction().hasFnAttribute("oxcaml-stack-check");
+}
+
+static void emitOxCamlStackCheck(MachineBasicBlock &MBB,
+                                 MachineBasicBlock::iterator MBBI,
+                                 const DebugLoc &DL,
+                                 const TargetInstrInfo *TII,
+                                 uint64_t StackSizeInBytes) {
+  if (StackSizeInBytes == 0)
+    return;
+
+  constexpr uint64_t StackThresholdWords = 32;
+  uint64_t RequiredWords = StackThresholdWords + alignTo(StackSizeInBytes, 8) / 8;
+  std::string Asm =
+      "mov x17, x30\n\t"
+      "ldr x16, [x28, #40]\n\t"
+      "adrp x30, _caml_plat_pagesize@GOTPAGE\n\t"
+      "ldr x30, [x30, _caml_plat_pagesize@GOTPAGEOFF]\n\t"
+      "ldr x30, [x30]\n\t"
+      "add x16, x16, x30, lsl #1\n\t"
+      "mov x30, #" +
+      std::to_string(RequiredWords) +
+      "\n\t"
+      "add x16, x16, x30, lsl #3\n\t"
+      "cmp sp, x16\n\t"
+      "b.hs 9f\n\t"
+      "mov x16, #" +
+      std::to_string(RequiredWords) +
+      "\n\t"
+      "bl _caml_llvm_prologue_realloc_stack\n"
+      "9:\n\t"
+      "mov x30, x17";
+  unsigned ExtraInfo = InlineAsm::Extra_HasSideEffects | InlineAsm::Extra_MayLoad |
+                       InlineAsm::Extra_MayStore;
+  BuildMI(MBB, MBBI, DL, TII->get(TargetOpcode::INLINEASM))
+      .addExternalSymbol(MBB.getParent()->createExternalSymbolName(Asm))
+      .addImm(ExtraInfo)
+      .setMIFlags(MachineInstr::FrameSetup);
+}
+
 static bool needsWinCFI(const MachineFunction &MF) {
   const Function &F = MF.getFunction();
   return MF.getTarget().getMCAsmInfo()->usesWindowsCFI() &&
@@ -1290,6 +1338,22 @@ static bool IsSVECalleeSave(MachineBasicBlock::iterator I) {
   }
 }
 
+static bool isCalleeSaveSaveOpcode(unsigned Opc) {
+  switch (Opc) {
+  default:
+    return false;
+  case AArch64::STPXi:
+  case AArch64::STRXui:
+  case AArch64::STPDi:
+  case AArch64::STRDui:
+  case AArch64::STPQi:
+  case AArch64::STRQui:
+  case AArch64::STR_ZXI:
+  case AArch64::STR_PXI:
+    return true;
+  }
+}
+
 static bool needsShadowCallStackPrologueEpilogue(MachineFunction &MF) {
   if (!(llvm::any_of(
             MF.getFrameInfo().getCalleeSavedInfo(),
@@ -1518,6 +1582,8 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
           .setMIFlag(MachineInstr::FrameSetup);
     }
 
+    if (needsOxCamlStackCheck(MF))
+      emitOxCamlStackCheck(MBB, MBB.begin(), DL, TII, NumBytes);
     return;
   }
 
@@ -1528,7 +1594,16 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
   auto PrologueSaveSize = AFI->getCalleeSavedStackSize() + FixedObject;
   // All of the remaining stack allocations are for locals.
   AFI->setLocalStackSize(NumBytes - PrologueSaveSize);
-  bool CombineSPBump = shouldCombineCSRLocalStackBump(MF, NumBytes);
+  const bool NeedsRealignmentForOxCamlStackCheck =
+      NumBytes && !IsFunclet && RegInfo->hasStackRealignment(MF);
+  int64_t OxCamlStackCheckRealignmentPadding =
+      (NeedsRealignmentForOxCamlStackCheck && MFI.getMaxAlign() > Align(16))
+          ? MFI.getMaxAlign().value() - 16
+          : 0;
+  int64_t OxCamlStackCheckSize =
+      NumBytes + OxCamlStackCheckRealignmentPadding;
+  bool CombineSPBump =
+      !needsOxCamlStackCheck(MF) && shouldCombineCSRLocalStackBump(MF, NumBytes);
   bool HomPrologEpilog = homogeneousPrologEpilog(MF);
   if (CombineSPBump) {
     assert(!SVEStackSize && "Cannot combine SP bump with SVE");
@@ -1539,6 +1614,16 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     NumBytes = 0;
   } else if (HomPrologEpilog) {
     // Stack has been already adjusted.
+    NumBytes -= PrologueSaveSize;
+  } else if (PrologueSaveSize != 0 && needsOxCamlStackCheck(MF)) {
+    MachineBasicBlock::iterator FirstCSR = MBBI;
+    MachineBasicBlock::iterator End = MBB.end();
+    while (FirstCSR != End && !isCalleeSaveSaveOpcode(FirstCSR->getOpcode()))
+      ++FirstCSR;
+    emitFrameOffset(MBB, FirstCSR, DL, AArch64::SP, AArch64::SP,
+                    StackOffset::getFixed(-static_cast<int64_t>(PrologueSaveSize)), TII,
+                    MachineInstr::FrameSetup, false, NeedsWinCFI, &HasWinCFI,
+                    EmitCFI);
     NumBytes -= PrologueSaveSize;
   } else if (PrologueSaveSize != 0) {
     MBBI = convertCalleeSaveRestoreToSPPrePostIncDec(
@@ -1858,6 +1943,9 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
       MBB.addLiveIn(AArch64::X1);
     }
   }
+
+  if (needsOxCamlStackCheck(MF))
+    emitOxCamlStackCheck(MBB, MBB.begin(), DL, TII, OxCamlStackCheckSize);
 }
 
 static void InsertReturnAddressAuth(MachineFunction &MF, MachineBasicBlock &MBB,
@@ -3054,7 +3142,8 @@ void AArch64FrameLowering::determineCalleeSaves(MachineFunction &MF,
   // The frame record needs to be created by saving the appropriate registers
   uint64_t EstimatedStackSize = MFI.estimateStackSize(MF);
   if (hasFP(MF) ||
-      windowsRequiresStackProbe(MF, EstimatedStackSize + CSStackSize + 16)) {
+      windowsRequiresStackProbe(MF, EstimatedStackSize + CSStackSize + 16) ||
+      (needsOxCamlStackCheck(MF) && EstimatedStackSize != 0)) {
     SavedRegs.set(AArch64::FP);
     SavedRegs.set(AArch64::LR);
   }

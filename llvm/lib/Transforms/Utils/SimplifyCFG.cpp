@@ -1800,6 +1800,14 @@ static bool canSinkInstructions(
         I->getType()->isTokenTy())
       return false;
 
+    // A gc.relocate on an invoke unwind path is tied to the landingpad value,
+    // which in turn identifies the invoke statepoint it belongs to. Sinking
+    // multiple such relocates through a PHI of landingpads loses that
+    // association.
+    if (const auto *Relocate = dyn_cast<GCRelocateInst>(I))
+      if (isa<LandingPadInst>(Relocate->getArgOperand(0)))
+        return false;
+
     // Do not try to sink an instruction in an infinite loop - it can cause
     // this algorithm to infinite loop.
     if (I->getParent()->getSingleSuccessor() == I->getParent())

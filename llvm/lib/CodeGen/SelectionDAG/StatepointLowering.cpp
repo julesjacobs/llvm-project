@@ -42,6 +42,7 @@
 #include "llvm/IR/Type.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MachineValueType.h"
 #include "llvm/Target/TargetMachine.h"
 #include "llvm/Target/TargetOptions.h"
@@ -1216,6 +1217,14 @@ void SelectionDAGBuilder::visitGCRelocate(const GCRelocateInst &Relocate) {
   auto &RelocationMap =
       FuncInfo.StatepointRelocationMaps[cast<GCStatepointInst>(Statepoint)];
   auto SlotIt = RelocationMap.find(&Relocate);
+  if (SlotIt == RelocationMap.end()) {
+    std::string Message;
+    raw_string_ostream OS(Message);
+    OS << "missing statepoint relocation record\n"
+       << "relocate: " << Relocate << "\n"
+       << "statepoint: " << *Statepoint << "\n";
+    report_fatal_error(StringRef(OS.str()), false);
+  }
   assert(SlotIt != RelocationMap.end() && "Relocating not lowered gc value");
   const RecordType &Record = SlotIt->second;
 

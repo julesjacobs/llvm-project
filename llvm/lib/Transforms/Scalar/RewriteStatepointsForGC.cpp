@@ -1683,7 +1683,12 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
   // be replacing a terminator.
   IRBuilder<> Builder(Call);
 
-  ArrayRef<Value *> GCArgs(LiveVariables);
+  SmallVector<Value *, 16> GCArgsStorage(LiveVariables.begin(),
+                                         LiveVariables.end());
+  if (auto Bundle = Call->getOperandBundle(LLVMContext::OB_gc_live))
+    for (const Use &U : Bundle->Inputs)
+      GCArgsStorage.push_back(U.get());
+  ArrayRef<Value *> GCArgs(GCArgsStorage);
   uint64_t StatepointID = StatepointDirectives::DefaultStatepointID;
   uint32_t NumPatchBytes = 0;
   uint32_t Flags = uint32_t(StatepointFlags::None);

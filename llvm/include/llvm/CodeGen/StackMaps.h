@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace llvm {
@@ -324,15 +325,18 @@ public:
     const MCExpr *CSOffsetExpr = nullptr;
     const FunctionInfo CSFunctionInfo;
     uint64_t ID = 0;
+    std::string FunctionName;
     LocationVec Locations;
     LiveOutVec LiveOuts;
 
     CallsiteInfo() = default;
     CallsiteInfo(const MCSymbol *CSLabel, const MCExpr *CSOffsetExpr,
                  const FunctionInfo CSFunctionInfo, uint64_t ID,
-                 LocationVec &&Locations, LiveOutVec &&LiveOuts)
+                 std::string FunctionName, LocationVec &&Locations,
+                 LiveOutVec &&LiveOuts)
         : CSLabel(CSLabel), CSOffsetExpr(CSOffsetExpr),
-          CSFunctionInfo(CSFunctionInfo), ID(ID), Locations(std::move(Locations)),
+          CSFunctionInfo(CSFunctionInfo), ID(ID),
+          FunctionName(std::move(FunctionName)), Locations(std::move(Locations)),
           LiveOuts(std::move(LiveOuts)) {}
   };
 

@@ -13,6 +13,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/ADT/Triple.h"
 #include "llvm/CodeGen/AsmPrinter.h"
 #include "llvm/CodeGen/GCMetadata.h"
 #include "llvm/CodeGen/GCMetadataPrinter.h"
@@ -33,6 +34,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 using namespace llvm;
 
@@ -102,8 +104,10 @@ void OxCamlGCMetadataPrinter::finishAssembly(Module &M, GCModuleInfo &Info,
 }
 
 /// Map LLVM DWARF register numbers to OxCaml register map.
-/// * See llvm/lib/Target/X86/X86RegisterInfo.td for DWARF register numbers.
-/// * See backend/amd64/proc.ml for the OxCaml register map.
+/// * See llvm/lib/Target/X86/X86RegisterInfo.td and
+///   llvm/lib/Target/AArch64/AArch64RegisterInfo.td for DWARF register numbers.
+/// * See backend/amd64/proc.ml and backend/arm64/proc.ml for the OxCaml
+///   register maps.
 
 // TODO: This is target-specific and should probably live in a
 // target-specific location.
@@ -129,7 +133,7 @@ static const unsigned XMMBeginOxCaml = 100;
 static const unsigned XMMBeginDwarf = 17;
 static const unsigned XMMEndDwarf = 32;
 
-static unsigned mapLLVMDwarfRegToOxCamlIndex(unsigned DwarfRegNum) {
+static unsigned mapX86DwarfRegToOxCamlIndex(unsigned DwarfRegNum) {
   if (DwarfRegNum < GPR_DwarfToOxCaml.size()) {
     return GPR_DwarfToOxCaml[DwarfRegNum];
   } else if (XMMBeginDwarf <= DwarfRegNum && DwarfRegNum <= XMMEndDwarf) {
@@ -137,6 +141,36 @@ static unsigned mapLLVMDwarfRegToOxCamlIndex(unsigned DwarfRegNum) {
   } else {
     report_fatal_error("[OxCamlGCPrinter] unrecognised DWARF register: "
       + Twine(DwarfRegNum));
+  }
+}
+
+static unsigned mapAArch64DwarfRegToOxCamlIndex(unsigned DwarfRegNum) {
+  // backend/arm64/regs.ml uses the following integer register order:
+  // x0-x15, x19-x28, x16-x17.
+  if (DwarfRegNum <= 15) {
+    return DwarfRegNum;
+  } else if (19 <= DwarfRegNum && DwarfRegNum <= 28) {
+    return DwarfRegNum - 3;
+  } else if (DwarfRegNum == 16 || DwarfRegNum == 17) {
+    return DwarfRegNum + 10;
+  } else {
+    report_fatal_error("[OxCamlGCPrinter] unrecognised AArch64 DWARF register: "
+      + Twine(DwarfRegNum));
+  }
+}
+
+static unsigned mapLLVMDwarfRegToOxCamlIndex(const Module &M,
+                                             unsigned DwarfRegNum) {
+  Triple TheTriple(M.getTargetTriple());
+  switch (TheTriple.getArch()) {
+  case Triple::x86_64:
+    return mapX86DwarfRegToOxCamlIndex(DwarfRegNum);
+  case Triple::aarch64:
+  case Triple::aarch64_32:
+    return mapAArch64DwarfRegToOxCamlIndex(DwarfRegNum);
+  default:
+    report_fatal_error("[OxCamlGCPrinter] unsupported target: "
+      + Twine(M.getTargetTriple()));
   }
 }
 
@@ -162,11 +196,312 @@ static uint8_t encodeAllocSize(uint64_t AllocSize) {
 }
 
 static const int AllocMask = 2;
+static const int DebugMask = 1;
 static const int FrameSizeReservedMask = 3; // Debug + Alloc
+static const int64_t OxCamlDebugDeoptMarker = 0x6f786364;
+static const int64_t OxCamlDebugDeoptVersion = 1;
+
+struct OxCamlDebugItem {
+  uint32_t Line = 0;
+  uint32_t EndLineDelta = 0;
+  uint32_t StartChr = 0;
+  uint32_t EndChr = 0;
+  uint32_t CharEndOffset = 0;
+  uint32_t EndOffset = 0;
+  std::string FunctionName;
+  std::string FileName;
+};
+
+struct OxCamlDebugInfo {
+  bool Valid = false;
+  bool PrimitiveCall = false;
+  bool RaiseCall = false;
+  std::vector<OxCamlDebugItem> Items;
+};
+
+struct PendingDebugItem {
+  MCSymbol *NameLabel;
+  MCSymbol *FileLabel;
+  OxCamlDebugItem Info;
+};
+
+struct PendingDebugInfo {
+  MCSymbol *DebugLabel;
+  OxCamlDebugInfo Info;
+};
+
+static uint32_t clampDebugField(int64_t Value, uint32_t Max) {
+  if (Value < 0)
+    return 0;
+  if (Value > Max)
+    return Max;
+  return static_cast<uint32_t>(Value);
+}
+
+static uint32_t clampDebugLine(int64_t Value) {
+  if (Value < 1)
+    return 1;
+  if (Value > 0x7ffff)
+    return 0x7ffff;
+  return static_cast<uint32_t>(Value);
+}
+
+static bool readConstant(const StackMaps::CallsiteInfo &CSI, size_t &Index,
+                         int64_t &Value) {
+  if (Index >= CSI.Locations.size())
+    return false;
+  const auto &Loc = CSI.Locations[Index++];
+  if (Loc.Type != StackMaps::Location::Constant)
+    return false;
+  Value = Loc.Offset;
+  return true;
+}
+
+static bool readDebugString(const StackMaps::CallsiteInfo &CSI, size_t &Index,
+                            std::string &String) {
+  int64_t LenValue = 0;
+  if (!readConstant(CSI, Index, LenValue) || LenValue < 0)
+    return false;
+  size_t Len = static_cast<size_t>(LenValue);
+  size_t NumChunks = (Len + 2) / 3;
+  String.clear();
+  String.reserve(Len);
+
+  for (size_t ChunkIndex = 0; ChunkIndex < NumChunks; ++ChunkIndex) {
+    int64_t Chunk = 0;
+    if (!readConstant(CSI, Index, Chunk) || Chunk < 0)
+      return false;
+    for (int Byte = 0; Byte < 3 && String.size() < Len; ++Byte)
+      String.push_back(static_cast<char>((Chunk >> (8 * Byte)) & 0xff));
+  }
+
+  return true;
+}
+
+static bool readDebugItem(const StackMaps::CallsiteInfo &CSI, size_t &Index,
+                          OxCamlDebugItem &Item) {
+  int64_t Line = 0;
+  int64_t EndLineDelta = 0;
+  int64_t StartChr = 0;
+  int64_t EndChr = 0;
+  int64_t CharEndOffset = 0;
+  int64_t EndOffset = 0;
+  if (!readConstant(CSI, Index, Line) ||
+      !readConstant(CSI, Index, EndLineDelta) ||
+      !readConstant(CSI, Index, StartChr) ||
+      !readConstant(CSI, Index, EndChr) ||
+      !readConstant(CSI, Index, CharEndOffset) ||
+      !readConstant(CSI, Index, EndOffset))
+    return false;
+
+  Item.Line = clampDebugLine(Line);
+  Item.EndLineDelta = clampDebugField(EndLineDelta, 0x3ffff);
+  Item.StartChr = clampDebugField(StartChr, 0xffff);
+  Item.EndChr = clampDebugField(EndChr, 0xffff);
+  Item.CharEndOffset = clampDebugField(CharEndOffset, 0x3fffffff);
+  Item.EndOffset = clampDebugField(EndOffset, 0x3fffffff);
+  return readDebugString(CSI, Index, Item.FileName) &&
+         readDebugString(CSI, Index, Item.FunctionName);
+}
+
+static OxCamlDebugInfo debugInfoForCallsite(
+    const StackMaps::CallsiteInfo &CSI) {
+  for (size_t I = 0; I < CSI.Locations.size(); ++I) {
+    const auto &Marker = CSI.Locations[I];
+    if (Marker.Type != StackMaps::Location::Constant ||
+        Marker.Offset != OxCamlDebugDeoptMarker) {
+      continue;
+    }
+
+    size_t Index = I + 1;
+    int64_t Version = 0;
+    int64_t Kind = 0;
+    int64_t NumItems = 0;
+    if (!readConstant(CSI, Index, Version) ||
+        Version != OxCamlDebugDeoptVersion ||
+        !readConstant(CSI, Index, Kind) ||
+        !readConstant(CSI, Index, NumItems) || NumItems <= 0) {
+      continue;
+    }
+
+    OxCamlDebugInfo Info;
+    Info.Valid = true;
+    Info.PrimitiveCall = Kind == 1;
+    Info.RaiseCall = Kind == 2;
+
+    for (int64_t ItemIndex = 0; ItemIndex < NumItems; ++ItemIndex) {
+      OxCamlDebugItem Item;
+      if (!readDebugItem(CSI, Index, Item))
+        return OxCamlDebugInfo();
+      Info.Items.push_back(std::move(Item));
+    }
+
+    if (!Info.Items.empty())
+      return Info;
+  }
+
+  return OxCamlDebugInfo();
+}
+
+static std::vector<uint8_t> encodedAllocSizes(uint64_t AllocSize) {
+  std::vector<uint8_t> Sizes;
+
+  if (AllocSize == 0)
+    return Sizes;
+  if (AllocSize < 2) {
+    report_fatal_error("[OxCamlGCPrinter] alloc size must at least be two!");
+  }
+
+  int MaxAllocSize = 257;
+
+  if (AllocSize % MaxAllocSize == 0) {
+    size_t NumAlloc = AllocSize / MaxAllocSize;
+    Sizes.assign(NumAlloc, encodeAllocSize(MaxAllocSize));
+  } else if (AllocSize % MaxAllocSize == 1) {
+    size_t NumMaxAlloc = AllocSize / MaxAllocSize - 1;
+    Sizes.assign(NumMaxAlloc, encodeAllocSize(MaxAllocSize));
+    Sizes.push_back(encodeAllocSize(MaxAllocSize - 1));
+    Sizes.push_back(encodeAllocSize(2));
+  } else {
+    size_t NumMaxAlloc = AllocSize / MaxAllocSize;
+    Sizes.assign(NumMaxAlloc, encodeAllocSize(MaxAllocSize));
+    Sizes.push_back(encodeAllocSize(AllocSize % MaxAllocSize));
+  }
+
+  return Sizes;
+}
+
+static bool isAArch64Target(const Module &M) {
+  Triple TheTriple(M.getTargetTriple());
+  return TheTriple.getArch() == Triple::aarch64 ||
+         TheTriple.getArch() == Triple::aarch64_32;
+}
+
+static void emitStackOffset(MCStreamer &OS, uint64_t FrameSize,
+                            unsigned PtrSize, int64_t Offset) {
+  // BP-relative addressing -> SP
+  if (Offset < 0) {
+    int64_t TempFrameSize =
+      FrameSize - PtrSize /* return address */ - PtrSize /* pushed BP */;
+    Offset += TempFrameSize;
+  }
+
+  if (Offset < -(1 << 15) || Offset >= (1 << 15)) {
+    report_fatal_error("[OxCamlGCPrinter] stack offset too large: "
+      + Twine(Offset));
+  }
+  OS.emitInt16(static_cast<uint16_t>(Offset));
+}
+
+static void emitDebugOffset(MCStreamer &OS, const MCSymbol *DebugLabel) {
+  MCSymbol *Here = OS.getContext().createTempSymbol();
+  OS.emitValueToAlignment(Align(4));
+  OS.emitLabel(Here);
+  const MCExpr *Offset = MCBinaryExpr::createSub(
+      MCSymbolRefExpr::create(DebugLabel, OS.getContext()),
+      MCSymbolRefExpr::create(Here, OS.getContext()), OS.getContext());
+  OS.emitValue(Offset, 4);
+}
+
+static void emitStringz(MCStreamer &OS, StringRef String) {
+  OS.emitBytes(String);
+  OS.emitInt8(0);
+}
+
+static bool isFullyPackable(const OxCamlDebugItem &Info) {
+  return Info.Line <= 0xfff && Info.EndLineDelta <= 0x7 &&
+         Info.StartChr <= 0x3f && Info.EndChr <= 0x7f &&
+         Info.CharEndOffset <= 0x1ff;
+}
+
+static uint64_t packDebugInfo(const OxCamlDebugItem &Info, bool IsRaise,
+                              bool HasNext) {
+  if (isFullyPackable(Info)) {
+    return (uint64_t(Info.Line) << 51) |
+           (uint64_t(Info.EndLineDelta) << 48) |
+           (uint64_t(Info.StartChr) << 42) |
+           (uint64_t(Info.EndChr) << 35) |
+           (uint64_t(Info.CharEndOffset) << 26) |
+           (uint64_t(IsRaise ? 1 : 0) << 1) |
+           uint64_t(HasNext ? 1 : 0);
+  }
+
+  return (uint64_t(1) << 63) |
+         (uint64_t(std::min<uint32_t>(Info.Line, 0x7ffff)) << 44) |
+         (uint64_t(std::min<uint32_t>(Info.EndLineDelta, 0x3ffff)) << 26) |
+         (uint64_t(IsRaise ? 1 : 0) << 1) | uint64_t(HasNext ? 1 : 0);
+}
+
+static void emitDebugInfoRecord(MCStreamer &OS, const MCSymbol *NameLabel,
+                                const OxCamlDebugItem &Info, bool IsRaise,
+                                bool HasNext) {
+  uint64_t PackedInfo = packDebugInfo(Info, IsRaise, HasNext);
+  uint32_t InfoLow = static_cast<uint32_t>(PackedInfo);
+  uint32_t InfoHigh = static_cast<uint32_t>(PackedInfo >> 32);
+
+  MCSymbol *Here = OS.getContext().createTempSymbol();
+  OS.emitLabel(Here);
+  const MCExpr *NameOffset = MCBinaryExpr::createSub(
+      MCSymbolRefExpr::create(NameLabel, OS.getContext()),
+      MCSymbolRefExpr::create(Here, OS.getContext()), OS.getContext());
+  const MCExpr *FirstWord = MCBinaryExpr::createAdd(
+      NameOffset, MCConstantExpr::create(InfoLow, OS.getContext()),
+      OS.getContext());
+  OS.emitValue(FirstWord, 4);
+  OS.emitInt32(InfoHigh);
+}
+
+static void emitNameAndLocInfo(MCStreamer &OS, const PendingDebugItem &Item) {
+  OS.emitValueToAlignment(Align(4));
+  OS.emitLabel(Item.NameLabel);
+  const MCExpr *FileOffset = MCBinaryExpr::createSub(
+      MCSymbolRefExpr::create(Item.FileLabel, OS.getContext()),
+      MCSymbolRefExpr::create(Item.NameLabel, OS.getContext()),
+      OS.getContext());
+  OS.emitValue(FileOffset, 4);
+  if (!isFullyPackable(Item.Info)) {
+    OS.emitInt16(static_cast<uint16_t>(
+        std::min<uint32_t>(Item.Info.StartChr, 0xffff)));
+    OS.emitInt16(
+        static_cast<uint16_t>(std::min<uint32_t>(Item.Info.EndChr, 0xffff)));
+    OS.emitInt32(static_cast<int32_t>(
+        std::min<uint32_t>(Item.Info.EndOffset, 0x3fffffff)));
+  }
+  emitStringz(OS, Item.Info.FunctionName);
+
+  OS.emitLabel(Item.FileLabel);
+  emitStringz(OS, Item.Info.FileName);
+}
+
+static void emitPendingDebugInfo(MCStreamer &OS,
+                                 const PendingDebugInfo &DebugInfo) {
+  const OxCamlDebugInfo &Info = DebugInfo.Info;
+  std::vector<PendingDebugItem> Items;
+  for (const OxCamlDebugItem &Item : Info.Items) {
+    Items.push_back({OS.getContext().createTempSymbol(),
+                     OS.getContext().createTempSymbol(), Item});
+  }
+
+  OS.emitValueToAlignment(Align(4));
+  OS.emitLabel(DebugInfo.DebugLabel);
+  if (Info.RaiseCall) {
+    for (size_t I = 0; I < Items.size(); ++I)
+      emitDebugInfoRecord(OS, Items[I].NameLabel, Items[I].Info, I == 0,
+                          I + 1 < Items.size());
+  } else {
+    for (size_t I = 0; I < Items.size(); ++I)
+      emitDebugInfoRecord(OS, Items[I].NameLabel, Items[I].Info, false,
+                          I + 1 < Items.size());
+  }
+
+  for (const PendingDebugItem &Item : Items)
+    emitNameAndLocInfo(OS, Item);
+}
 
 bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter &AP) {
   MCStreamer &OS = *AP.OutStreamer;
   unsigned PtrSize = M.getDataLayout().getPointerSize(); // Can only be 8 for now
+  std::vector<PendingDebugInfo> PendingDebugInfos;
   
   OS.switchSection(AP.getObjFileLowering().getDataSection());
   
@@ -197,35 +532,54 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
 
     // frame_data
     uint64_t FrameSize = CSI.CSFunctionInfo.StaticStackSize;
-    FrameSize += PtrSize; // Return address
+    bool IsAArch64 = isAArch64Target(M);
+    if (!IsAArch64)
+      FrameSize += PtrSize; // Return address
 
     // The LLVM IR emitted from OxCaml will always set the statepoint ID for
     // calls to be wrapped in a statepoint. Also, note that DefaultStatepointID
     // (= 0xABCDEF00 as of now) does not clash with the encoding we use since
     // anything that sets the upper 16 bits will also set the bottom bit.
     if (CSI.ID != StatepointDirectives::DefaultStatepointID) {
-      // Stack offset from OxCaml (in case LLVM says we have dynamic objects)
-      // This will get set to UINT64_MAX in `StackMaps.recordStackMapOpers` if
-      // that is the case.
-      if (CSI.CSFunctionInfo.StackSize == UINT64_MAX) {
-        FrameSize += stackOffsetOfID(CSI.ID);
-      }
+      // Stack offset from OxCaml for active trap blocks and explicit stack
+      // adjustments. LLVM does not model this as part of the static frame size
+      // consistently across call sites, so apply the OxCaml offset directly.
+      FrameSize += stackOffsetOfID(CSI.ID);
 
       if (FrameSize & FrameSizeReservedMask) {
         report_fatal_error("[OxCamlGCPrinter] frame size has bottom bits set: "
           + Twine(FrameSize));
       }
       
-      // Alloc bit
-      if (IDHasAlloc(CSI.ID)) {
-        FrameSize |= AllocMask;
-      }
     }
 
-    if (FrameSize >= 1 << 16)
+    OxCamlDebugInfo DebugInfo = debugInfoForCallsite(CSI);
+    bool HasAlloc = CSI.ID != StatepointDirectives::DefaultStatepointID &&
+                    IDHasAlloc(CSI.ID);
+    uint64_t AllocSize = HasAlloc ? allocSizeOfID(CSI.ID) : 0;
+    std::vector<uint8_t> AllocSizes =
+        HasAlloc ? encodedAllocSizes(AllocSize) : std::vector<uint8_t>();
+    bool HasDebug = DebugInfo.Valid && (!HasAlloc || AllocSize != 0);
+
+    MCSymbol *DebugLabel = nullptr;
+    if (HasDebug) {
+      DebugLabel = OS.getContext().createTempSymbol();
+      PendingDebugInfos.push_back({DebugLabel, std::move(DebugInfo)});
+    }
+
+    uint64_t FrameData = FrameSize;
+
+    if (HasAlloc) {
+      FrameData |= AllocMask;
+    }
+    if (HasDebug) {
+      FrameData |= DebugMask;
+    }
+
+    if (FrameData >= 1 << 16)
       report_fatal_error("[OxCamlGCPrinter] frame size requires long frames: "
-        + Twine(FrameSize));
-    OS.emitInt16(FrameSize);
+        + Twine(FrameData));
+    OS.emitInt16(FrameData);
 
     // num_live
     uint64_t LiveCount = 0;
@@ -236,8 +590,6 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
         LiveCount++;
       }
     }
-    LiveCount += CSI.LiveOuts.size();
-
     if (LiveCount >= 1 << 16) {
       // Very rude!
       report_fatal_error("[OxCamlGCPrinter] live count requires long frames: "
@@ -251,90 +603,44 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
         // Register indices are tagged (2n+1) and follow the OxCaml register
         // map (see `mapLLVMDwarfRegToOxCamlIndex`)
         unsigned DwarfRegNum = Loc.Reg;
-        unsigned OxCamlIndex = mapLLVMDwarfRegToOxCamlIndex(DwarfRegNum);
+        unsigned OxCamlIndex = mapLLVMDwarfRegToOxCamlIndex(M, DwarfRegNum);
         uint16_t EncodedReg = (OxCamlIndex << 1) + 1;
         OS.emitInt16(EncodedReg);
-      } else if (Loc.Type == StackMaps::Location::Direct ||
-                 Loc.Type == StackMaps::Location::Indirect) {
-        // For stack locations (Direct/Indirect): emit offset directly
-        int64_t Offset = Loc.Offset;
-
-        // BP-relative addressing -> SP
-        if (Offset < 0) {
-          int64_t TempFrameSize =
-            FrameSize - PtrSize /* return address */ - PtrSize /* pushed BP */;
-          Offset += TempFrameSize;
-        }
-        
-        if (Offset < -(1 << 15) || Offset >= (1 << 15)) {
-          // Very rude!
-          report_fatal_error("[OxCamlGCPrinter] stack offset too large: "
-            + Twine(Offset));
-        }
-        OS.emitInt16(static_cast<uint16_t>(Offset));
+      } else if (Loc.Type == StackMaps::Location::Direct) {
+        // Direct stack locations are explicit alloca roots passed through the
+        // statepoint. The live offset is the stack slot itself.
+        emitStackOffset(OS, FrameSize, PtrSize, Loc.Offset);
+      } else if (Loc.Type == StackMaps::Location::Indirect) {
+        // For spilled stack values, emit the offset directly.
+        emitStackOffset(OS, FrameSize, PtrSize, Loc.Offset);
       } else {
         // TODO: Do we need anything else here?
       }
     }
 
-    for (const auto &LO : CSI.LiveOuts) {
-      unsigned OxCamlIndex = mapLLVMDwarfRegToOxCamlIndex(LO.DwarfRegNum);
-      uint16_t EncodedReg = (OxCamlIndex << 1) + 1;
-      OS.emitInt16(EncodedReg);
-    }
-
-    if (IDHasAlloc(CSI.ID)) {
-      int AllocSize = allocSizeOfID(CSI.ID);
-
+    if (HasAlloc) {
       if (AllocSize == 0) {
         // Poll frames are encoded like allocation frames with no allocation
         // entries. This matches Dbg_alloc [] in OxCaml's normal backend.
         OS.emitInt8(0);
-      } else if (AllocSize < 2) {
-        report_fatal_error("[OxCamlGCPrinter] alloc size must at least be two!");
       } else {
-
-        // Allocations can theoretically go up to 255 * 257 = 65535 words,
-        // but in practice comballoc never gives us allocations that exceed 255,
-        // so this handling isn't necessarily needed, but it's here just in case.
-
-        int MaxAllocSize = 257;
-
-        if (AllocSize % MaxAllocSize == 0) {
-          size_t NumAlloc = AllocSize / MaxAllocSize;
-
-          OS.emitInt8(NumAlloc);
-          for (size_t i = 0; i < NumAlloc; ++i) {
-            OS.emitInt8(encodeAllocSize(MaxAllocSize));
-          }
-        } else if (AllocSize % MaxAllocSize == 1) {
-          // This is special since we cannot have allocations of size 1...
-
-          // Guaranteed to be nonnegative
-          size_t NumMaxAlloc = AllocSize / MaxAllocSize - 1;
-
-          OS.emitInt8(NumMaxAlloc + 2);
-          for (size_t i = 0; i < NumMaxAlloc; ++i) {
-            OS.emitInt8(encodeAllocSize(MaxAllocSize));
-          }
-
-          OS.emitInt8(encodeAllocSize(MaxAllocSize - 1));
-          OS.emitInt8(encodeAllocSize(2));
-        } else {
-          size_t NumMaxAlloc = AllocSize / MaxAllocSize;
-
-          OS.emitInt8(NumMaxAlloc + 1);
-          for (size_t i = 0; i < NumMaxAlloc; ++i) {
-            OS.emitInt8(encodeAllocSize(MaxAllocSize));
-          }
-
-          OS.emitInt8(encodeAllocSize(AllocSize % MaxAllocSize));
-        }
+        OS.emitInt8(AllocSizes.size());
+        for (uint8_t Size : AllocSizes)
+          OS.emitInt8(Size);
       }
+    }
+
+    if (HasDebug) {
+      size_t NumDebugOffsets = HasAlloc ? AllocSizes.size() : 1;
+      for (size_t I = 0; I < NumDebugOffsets; ++I)
+        emitDebugOffset(OS, DebugLabel);
     }
 
     OS.emitValueToAlignment(Align(PtrSize));
   }
+
+  for (const PendingDebugInfo &DebugInfo : PendingDebugInfos)
+    emitPendingDebugInfo(OS, DebugInfo);
 
   OS.addBlankLine();
   return true;

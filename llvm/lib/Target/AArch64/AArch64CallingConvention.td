@@ -17,6 +17,12 @@ class CCIfBigEndian<CCAction A> :
 class CCIfILP32<CCAction A> :
   CCIf<"State.getMachineFunction().getDataLayout().getPointerSize() == 4", A>;
 
+class CCIfDarwin<CCAction A> :
+  CCIf<"State.getMachineFunction().getSubtarget<AArch64Subtarget>().isTargetDarwin()", A>;
+
+class CCIfNotDarwin<CCAction A> :
+  CCIf<"!State.getMachineFunction().getSubtarget<AArch64Subtarget>().isTargetDarwin()", A>;
+
 
 //===----------------------------------------------------------------------===//
 // ARM AAPCS64 Calling Convention
@@ -151,6 +157,31 @@ def RetCC_AArch64_AAPCS : CallingConv<[
 
   CCIfType<[nxv1i1, nxv2i1, nxv4i1, nxv8i1, nxv16i1],
            CCAssignToReg<[P0, P1, P2, P3]>>
+]>;
+
+// OxCaml runtime registers are threaded through calls and pinned by the calling
+// convention. On arm64, x28 is the domain state pointer and x27 is the
+// allocation pointer. x26 is the trap pointer, and x16/x17 are runtime/linker
+// temporaries. AArch64RegisterInfo reserves these registers for OxCaml
+// functions; see backend/arm64/proc.ml and runtime/arm64.S.
+def RetCC_AArch64_OxCaml : CallingConv<[
+  CCIfType<[i8, i16, i32], CCPromoteToType<i64>>,
+
+  CCIfDarwin<CCIfType<[i64],
+    CCAssignToReg<[X28, X27, X0, X1, X2, X3, X4, X5, X6, X7]>>>,
+  CCIfNotDarwin<CCIfType<[i64],
+    CCAssignToReg<[X28, X27, X0, X1, X2, X3, X4, X5, X6, X7,
+                   X8, X9, X10, X11, X12, X13, X14, X15]>>>,
+
+  CCIfType<[f32], CCAssignToReg<[S0, S1, S2, S3, S4, S5, S6, S7,
+                                 S8, S9, S10, S11, S12, S13, S14, S15]>>,
+  CCIfType<[f64], CCAssignToReg<[D0, D1, D2, D3, D4, D5, D6, D7,
+                                 D8, D9, D10, D11, D12, D13, D14, D15]>>
+]>;
+
+def RetCC_AArch64_OxCaml_C_Call : CallingConv<[
+  CCIfType<[i64], CCAssignToReg<[X28, X27]>>,
+  CCDelegateTo<RetCC_AArch64_AAPCS>
 ]>;
 
 // Vararg functions on windows pass floats in integer registers
@@ -385,6 +416,36 @@ def CC_AArch64_GHC : CallingConv<[
   CCIfType<[i64], CCAssignToReg<[X19, X20, X21, X22, X23, X24, X25, X26, X27, X28]>>
 ]>;
 
+def CC_AArch64_OxCaml : CallingConv<[
+  CCIfType<[iPTR], CCBitConvertToType<i64>>,
+  CCIfType<[i8, i16, i32], CCPromoteToType<i64>>,
+
+  CCIfDarwin<CCIfType<[i64],
+    CCAssignToReg<[X28, X27, X0, X1, X2, X3, X4, X5, X6, X7]>>>,
+  CCIfNotDarwin<CCIfType<[i64],
+    CCAssignToReg<[X28, X27, X0, X1, X2, X3, X4, X5, X6, X7,
+                   X8, X9, X10, X11, X12, X13, X14, X15]>>>,
+
+  CCIfType<[f32], CCAssignToReg<[S0, S1, S2, S3, S4, S5, S6, S7,
+                                 S8, S9, S10, S11, S12, S13, S14, S15]>>,
+  CCIfType<[f64], CCAssignToReg<[D0, D1, D2, D3, D4, D5, D6, D7,
+                                 D8, D9, D10, D11, D12, D13, D14, D15]>>,
+
+  CCIfType<[i64, f32, f64], CCAssignToStack<8, 8>>
+]>;
+
+def CC_AArch64_OxCaml_C_Call : CallingConv<[
+  // x8 carries the C function pointer for caml_c_call.
+  CCIfType<[i64], CCAssignToReg<[X28, X27, X8]>>,
+  CCDelegateTo<CC_AArch64_AAPCS>
+]>;
+
+def CC_AArch64_OxCaml_C_Call_StackArgs : CallingConv<[
+  // x20/x21 delimit the copied stack argument range.
+  CCIfType<[i64], CCAssignToReg<[X28, X27, X8, X20, X21]>>,
+  CCDelegateTo<CC_AArch64_AAPCS>
+]>;
+
 // The order of the callee-saves in this file is important, because the
 // FrameLowering code will use this order to determine the layout the
 // callee-save area in the stack frame. As can be observed below, Darwin
@@ -485,6 +546,13 @@ def CSR_AArch64_AllRegs
                            (sequence "Q%u", 0, 31))>;
 
 def CSR_AArch64_NoRegs : CalleeSavedRegs<(add)>;
+
+def CSR_AArch64_OxCaml_WithFP : CalleeSavedRegs<(add LR, FP)>;
+def CSR_AArch64_OxCaml_WithoutFP : CalleeSavedRegs<(add LR, FP)>;
+def CSR_AArch64_OxCaml_C_Call : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X27, X28)>;
+def CSR_AArch64_OxCaml_C_Call_StackArgs
+    : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X20, X21, X27, X28)>;
+def CSR_AArch64_OxCaml_Alloc : CalleeSavedRegs<(sub CSR_AArch64_AllRegs, X8, X27, X28)>;
 
 def CSR_AArch64_RT_MostRegs :  CalleeSavedRegs<(add CSR_AArch64_AAPCS,
                                                 (sequence "X%u", 9, 15))>;

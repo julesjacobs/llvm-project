@@ -6205,6 +6205,14 @@ CCAssignFn *AArch64TargetLowering::CCAssignFnForCall(CallingConv::ID CC,
     return CC_AArch64_WebKit_JS;
   case CallingConv::GHC:
     return CC_AArch64_GHC;
+  case CallingConv::OxCaml_WithFP:
+  case CallingConv::OxCaml_WithoutFP:
+  case CallingConv::OxCaml_Alloc:
+    return CC_AArch64_OxCaml;
+  case CallingConv::OxCaml_C_Call:
+    return CC_AArch64_OxCaml_C_Call;
+  case CallingConv::OxCaml_C_Call_StackArgs:
+    return CC_AArch64_OxCaml_C_Call_StackArgs;
   case CallingConv::C:
   case CallingConv::Fast:
   case CallingConv::PreserveMost:
@@ -6242,8 +6250,19 @@ CCAssignFn *AArch64TargetLowering::CCAssignFnForCall(CallingConv::ID CC,
 
 CCAssignFn *
 AArch64TargetLowering::CCAssignFnForReturn(CallingConv::ID CC) const {
-  return CC == CallingConv::WebKit_JS ? RetCC_AArch64_WebKit_JS
-                                      : RetCC_AArch64_AAPCS;
+  switch (CC) {
+  case CallingConv::WebKit_JS:
+    return RetCC_AArch64_WebKit_JS;
+  case CallingConv::OxCaml_WithFP:
+  case CallingConv::OxCaml_WithoutFP:
+  case CallingConv::OxCaml_Alloc:
+    return RetCC_AArch64_OxCaml;
+  case CallingConv::OxCaml_C_Call:
+  case CallingConv::OxCaml_C_Call_StackArgs:
+    return RetCC_AArch64_OxCaml_C_Call;
+  default:
+    return RetCC_AArch64_AAPCS;
+  }
 }
 
 
@@ -6842,6 +6861,8 @@ static bool mayTailCallThisCC(CallingConv::ID CC) {
   case CallingConv::SwiftTail:
   case CallingConv::Tail:
   case CallingConv::Fast:
+  case CallingConv::OxCaml_WithFP:
+  case CallingConv::OxCaml_WithoutFP:
     return true;
   default:
     return false;

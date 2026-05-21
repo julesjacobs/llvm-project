@@ -19,6 +19,7 @@
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
 #include "llvm/IR/DataLayout.h"
+#include "llvm/IR/Function.h"
 #include "llvm/MC/MCContext.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCObjectFileInfo.h"
@@ -33,6 +34,7 @@
 #include <cassert>
 #include <cstdint>
 #include <iterator>
+#include <string>
 #include <utility>
 
 using namespace llvm;
@@ -452,8 +454,11 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
       unsigned DerivedIdx = GCPtrIndices[P.second];
       LLVM_DEBUG(dbgs() << "Base : " << BaseIdx << " Derived : " << DerivedIdx
                         << "\n");
+      (void)DerivedIdx;
+      // The stackmap consumer for OxCaml frame tables can only expose base
+      // OCaml values to the runtime GC. Derived pointers remain available to
+      // gc.relocate, but must not be scanned as independent roots.
       (void)parseOperand(MOB + BaseIdx, MOE, Locations, LiveOuts);
-      (void)parseOperand(MOB + DerivedIdx, MOE, Locations, LiveOuts);
     }
 
     MOI = MOB + GCPtrIdx;
@@ -538,7 +543,8 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
 
   CSInfos.emplace_back(&MILabel, CSOffsetExpr,
                        FunctionInfo(StaticFrameSize, FrameSize),
-                       ID, std::move(Locations), std::move(LiveOuts));
+                       ID, AP.MF->getFunction().getName().str(),
+                       std::move(Locations), std::move(LiveOuts));
 }
 
 void StackMaps::recordStackMap(const MCSymbol &L, const MachineInstr &MI) {

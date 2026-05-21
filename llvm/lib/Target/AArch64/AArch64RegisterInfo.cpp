@@ -44,6 +44,19 @@ AArch64RegisterInfo::AArch64RegisterInfo(const Triple &TT)
   AArch64_MC::initLLVMToCVRegMapping(this);
 }
 
+static bool isOxCamlCallingConv(CallingConv::ID CC) {
+  switch (CC) {
+  case CallingConv::OxCaml_WithFP:
+  case CallingConv::OxCaml_WithoutFP:
+  case CallingConv::OxCaml_C_Call:
+  case CallingConv::OxCaml_C_Call_StackArgs:
+  case CallingConv::OxCaml_Alloc:
+    return true;
+  default:
+    return false;
+  }
+}
+
 /// Return whether the register needs a CFI entry. Not all unwinders may know
 /// about SVE registers, so we assume the lowest common denominator, i.e. the
 /// callee-saves required by the base ABI. For the SVE registers z8-z15 only the
@@ -75,6 +88,20 @@ AArch64RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
     // GHC set of callee saved regs is empty as all those regs are
     // used for passing STG regs around
     return CSR_AArch64_NoRegs_SaveList;
+  switch (MF->getFunction().getCallingConv()) {
+  case CallingConv::OxCaml_WithFP:
+    return CSR_AArch64_OxCaml_WithFP_SaveList;
+  case CallingConv::OxCaml_WithoutFP:
+    return CSR_AArch64_OxCaml_WithoutFP_SaveList;
+  case CallingConv::OxCaml_C_Call:
+    return CSR_AArch64_OxCaml_C_Call_SaveList;
+  case CallingConv::OxCaml_C_Call_StackArgs:
+    return CSR_AArch64_OxCaml_C_Call_StackArgs_SaveList;
+  case CallingConv::OxCaml_Alloc:
+    return CSR_AArch64_OxCaml_Alloc_SaveList;
+  default:
+    break;
+  }
   if (MF->getFunction().getCallingConv() == CallingConv::AnyReg)
     return CSR_AArch64_AllRegs_SaveList;
 
@@ -212,6 +239,20 @@ AArch64RegisterInfo::getDarwinCallPreservedMask(const MachineFunction &MF,
 
   if (CC == CallingConv::CXX_FAST_TLS)
     return CSR_Darwin_AArch64_CXX_TLS_RegMask;
+  switch (CC) {
+  case CallingConv::OxCaml_WithFP:
+    return CSR_AArch64_OxCaml_WithFP_RegMask;
+  case CallingConv::OxCaml_WithoutFP:
+    return CSR_AArch64_OxCaml_WithoutFP_RegMask;
+  case CallingConv::OxCaml_C_Call:
+    return CSR_AArch64_OxCaml_C_Call_RegMask;
+  case CallingConv::OxCaml_C_Call_StackArgs:
+    return CSR_AArch64_OxCaml_C_Call_StackArgs_RegMask;
+  case CallingConv::OxCaml_Alloc:
+    return CSR_AArch64_OxCaml_Alloc_RegMask;
+  default:
+    break;
+  }
   if (CC == CallingConv::AArch64_VectorCall)
     return CSR_Darwin_AArch64_AAVPCS_RegMask;
   if (CC == CallingConv::AArch64_SVE_VectorCall)
@@ -247,6 +288,20 @@ AArch64RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
   if (CC == CallingConv::GHC)
     // This is academic because all GHC calls are (supposed to be) tail calls
     return SCS ? CSR_AArch64_NoRegs_SCS_RegMask : CSR_AArch64_NoRegs_RegMask;
+  switch (CC) {
+  case CallingConv::OxCaml_WithFP:
+    return CSR_AArch64_OxCaml_WithFP_RegMask;
+  case CallingConv::OxCaml_WithoutFP:
+    return CSR_AArch64_OxCaml_WithoutFP_RegMask;
+  case CallingConv::OxCaml_C_Call:
+    return CSR_AArch64_OxCaml_C_Call_RegMask;
+  case CallingConv::OxCaml_C_Call_StackArgs:
+    return CSR_AArch64_OxCaml_C_Call_StackArgs_RegMask;
+  case CallingConv::OxCaml_Alloc:
+    return CSR_AArch64_OxCaml_Alloc_RegMask;
+  default:
+    break;
+  }
   if (CC == CallingConv::AnyReg)
     return SCS ? CSR_AArch64_AllRegs_SCS_RegMask : CSR_AArch64_AllRegs_RegMask;
 
@@ -405,6 +460,14 @@ AArch64RegisterInfo::getStrictlyReservedRegs(const MachineFunction &MF) const {
       markSuperRegs(Reserved, i);
   }
 
+  if (isOxCamlCallingConv(MF.getFunction().getCallingConv())) {
+    markSuperRegs(Reserved, AArch64::W16);
+    markSuperRegs(Reserved, AArch64::W17);
+    markSuperRegs(Reserved, AArch64::W26);
+    markSuperRegs(Reserved, AArch64::W27);
+    markSuperRegs(Reserved, AArch64::W28);
+  }
+
   for (size_t i = 0; i < AArch64::GPR32commonRegClass.getNumRegs(); ++i) {
     if (MF.getSubtarget<AArch64Subtarget>().isXRegisterReserved(i))
       markSuperRegs(Reserved, AArch64::GPR32commonRegClass.getRegister(i));
@@ -495,6 +558,13 @@ unsigned AArch64RegisterInfo::getBaseRegister() const { return AArch64::X19; }
 
 bool AArch64RegisterInfo::hasBasePointer(const MachineFunction &MF) const {
   const MachineFrameInfo &MFI = MF.getFrameInfo();
+
+  // AArch64 normally uses X19 as the base pointer, relying on the platform ABI
+  // rule that X19 is preserved by callees. OxCaml calls do not preserve X19, so
+  // an OxCaml function cannot keep stack frame state in the base pointer across
+  // calls.
+  if (isOxCamlCallingConv(MF.getFunction().getCallingConv()))
+    return false;
 
   // In the presence of variable sized objects or funclets, if the fixed stack
   // size is large enough that referencing from the FP won't result in things
