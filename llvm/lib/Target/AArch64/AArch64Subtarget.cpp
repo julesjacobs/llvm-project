@@ -65,6 +65,11 @@ ReservedRegsForRA("reserve-regs-for-regalloc", cl::desc("Reserve physical "
                   "Should only be used for testing register allocator."),
                   cl::CommaSeparated, cl::Hidden);
 
+static cl::opt<bool> OxCamlCalleeSavedX19ToX25(
+    "oxcaml-callee-saved-x19-x25",
+    cl::desc("Make X19-X25 callee-saved for OxCaml AArch64 code"),
+    cl::init(false), cl::Hidden);
+
 static cl::opt<bool>
     ForceStreamingCompatibleSVE("force-streaming-compatible-sve",
                                 cl::init(false), cl::Hidden);
@@ -303,6 +308,10 @@ AArch64Subtarget::AArch64Subtarget(const Triple &TT, StringRef CPU,
       TLInfo(TM, *this) {
   if (AArch64::isX18ReservedByDefault(TT))
     ReserveXRegister.set(18);
+
+  if (OxCamlCalleeSavedX19ToX25)
+    for (unsigned I = 19; I <= 25; ++I)
+      CustomCallSavedXRegs.set(I);
 
   CallLoweringInfo.reset(new AArch64CallLowering(*getTargetLowering()));
   InlineAsmLoweringInfo.reset(new InlineAsmLowering(getTargetLowering()));
