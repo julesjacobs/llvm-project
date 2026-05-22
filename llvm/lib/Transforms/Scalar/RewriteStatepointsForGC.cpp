@@ -69,6 +69,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iterator>
+#include <limits>
 #include <optional>
 #include <set>
 #include <string>
@@ -112,6 +113,30 @@ static cl::opt<bool>
 static cl::opt<bool> TreatAddrSpace1PhiSelectAsBase(
     "rs4gc-addrspace1-phi-select-base", cl::Hidden, cl::init(false),
     cl::desc("Treat scalar addrspace(1) phi/select values as base pointers"));
+
+static cl::opt<bool> RematAddrSpace1DerivedFromBaseAtAlloc(
+    "rs4gc-remat-addrspace1-derived-from-base-at-alloc", cl::Hidden,
+    cl::init(false),
+    cl::desc("At OxCaml statepoints, rematerialize scalar "
+             "addrspace(1) derived pointers from relocated bases instead of "
+             "relocating them"));
+
+static cl::opt<bool> DebugOxCamlDerivedRemat(
+    "rs4gc-debug-oxcaml-derived-remat", cl::Hidden, cl::init(false),
+    cl::desc("Print OxCaml statepoint derived/base candidates"));
+
+static cl::opt<unsigned> RematAddrSpace1DerivedFromBaseAtAllocSkip(
+    "rs4gc-remat-addrspace1-derived-from-base-at-alloc-skip", cl::Hidden,
+    cl::init(0), cl::desc("Skip this many accepted OxCaml statepoint derived "
+                          "rematerialization candidates"));
+
+static cl::opt<unsigned> RematAddrSpace1DerivedFromBaseAtAllocLimit(
+    "rs4gc-remat-addrspace1-derived-from-base-at-alloc-limit", cl::Hidden,
+    cl::init(std::numeric_limits<unsigned>::max()),
+    cl::desc("Allow at most this many accepted OxCaml statepoint derived "
+             "rematerialization candidates after the skip count"));
+
+static unsigned OxCamlDerivedRematAcceptedOrdinal = 0;
 
 static cl::opt<bool> RematDerivedAtUses("rs4gc-remat-derived-at-uses",
                                         cl::Hidden, cl::init(true));
@@ -1426,6 +1451,9 @@ static void recomputeLiveInValues(
   }
 }
 
+static Value *findRematerializableChainToBasePointer(
+    SmallVectorImpl<Instruction *> &ChainToBase, Value *CurrentValue);
+
 // Utility function which clones all instructions from "ChainToBase"
 // and inserts them before "InsertBefore". Returns rematerialized value
 // which should be used after statepoint.
@@ -1438,11 +1466,12 @@ static Instruction *rematerializeChain(ArrayRef<Instruction *> ChainToBase,
   // Walk backwards to visit top-most instructions first.
   for (Instruction *Instr :
        make_range(ChainToBase.rbegin(), ChainToBase.rend())) {
-    // Only GEP's and casts are supported as we need to be careful to not
-    // introduce any new uses of pointers not in the liveset.
+    // Only GEP's, casts, and freezes are supported as we need to be careful
+    // to not introduce any new uses of pointers not in the liveset.
     // Note that it's fine to introduce new uses of pointers which were
     // otherwise not used after this statepoint.
-    assert(isa<GetElementPtrInst>(Instr) || isa<CastInst>(Instr));
+    assert(isa<GetElementPtrInst>(Instr) || isa<CastInst>(Instr) ||
+           isa<FreezeInst>(Instr));
 
     Instruction *ClonedValue = Instr->clone();
     ClonedValue->insertBefore(InsertBefore);
@@ -1701,11 +1730,156 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
   // be replacing a terminator.
   IRBuilder<> Builder(Call);
 
-  SmallVector<Value *, 16> GCArgsStorage(LiveVariables.begin(),
-                                         LiveVariables.end());
+  DenseSet<Value *> LiveVariableSet;
+  for (Value *V : LiveVariables)
+    LiveVariableSet.insert(V);
+
+  DenseSet<Value *> RematerializedDerivedValues;
+  RematCandTy RematerializedDerivedChains;
+  const bool IsOxCamlStatepoint =
+      Call->getCallingConv() == CallingConv::OxCaml_WithFP ||
+      Call->getCallingConv() == CallingConv::OxCaml_WithoutFP ||
+      Call->getCallingConv() == CallingConv::OxCaml_Alloc;
+  auto PrintOxCamlDerivedCandidate = [&](Value *Derived, Value *Base) {
+    if (!DebugOxCamlDerivedRemat || !IsOxCamlStatepoint)
+      return;
+    errs() << "rs4gc-oxcaml-live in "
+           << Call->getFunction()->getName() << "\n  call: ";
+    Call->print(errs());
+    errs() << "\n  derived: ";
+    Derived->print(errs());
+    errs() << "\n  base: ";
+    Base->print(errs());
+    errs() << "\n  derived-kind: ";
+    if (auto *I = dyn_cast<Instruction>(Derived))
+      errs() << I->getOpcodeName();
+    else
+      errs() << "non-instruction";
+    errs() << "\n  base-kind: ";
+    if (auto *I = dyn_cast<Instruction>(Base))
+      errs() << I->getOpcodeName();
+    else
+      errs() << "non-instruction";
+    errs() << "\n";
+  };
+  auto ShouldRematerializeDerivedFromBase = [&](Value *Derived) {
+    auto Reject = [&](const char *Reason) {
+      if (DebugOxCamlDerivedRemat && IsOxCamlStatepoint)
+        errs() << "rs4gc-oxcaml-remat-reject " << Reason << "\n";
+      return false;
+    };
+    if (!RematAddrSpace1DerivedFromBaseAtAlloc)
+      return Reject("flag");
+    if (!IsOxCamlStatepoint)
+      return Reject("cc");
+    if (isa<InvokeInst>(Call))
+      return Reject("invoke");
+    auto BaseIt = PointerToBase.find(Derived);
+    if (BaseIt == PointerToBase.end())
+      return Reject("no-base");
+    Value *Base = BaseIt->second;
+    if (Base == Derived || !LiveVariableSet.contains(Base))
+      return Reject("self-or-base-not-live");
+    auto BaseBaseIt = PointerToBase.find(Base);
+    if (BaseBaseIt == PointerToBase.end() || BaseBaseIt->second != Base)
+      return Reject("base-not-self");
+    auto *DerivedTy = dyn_cast<PointerType>(Derived->getType());
+    auto *BaseTy = dyn_cast<PointerType>(Base->getType());
+    if (!DerivedTy || !BaseTy)
+      return Reject("not-pointers");
+    if (DerivedTy->getAddressSpace() != 1 || BaseTy->getAddressSpace() != 1)
+      return Reject("not-as1");
+
+    auto *DerivedInst = dyn_cast<Instruction>(Derived);
+    if (!DerivedInst)
+      return Reject("not-instruction");
+
+    RematerizlizationCandidateRecord Record;
+    auto FindPointerChainToBase =
+        [&](auto &&Self, SmallVectorImpl<Instruction *> &ChainToBase,
+            Value *CurrentValue) -> Value * {
+      if (GetElementPtrInst *GEP = dyn_cast<GetElementPtrInst>(CurrentValue)) {
+        ChainToBase.push_back(GEP);
+        return Self(Self, ChainToBase, GEP->getPointerOperand());
+      }
+
+      if (CastInst *CI = dyn_cast<CastInst>(CurrentValue)) {
+        if (!CI->getOperand(0)->getType()->isPtrOrPtrVectorTy() ||
+            !CI->isNoopCast(CI->getModule()->getDataLayout()))
+          return CI;
+
+        ChainToBase.push_back(CI);
+        return Self(Self, ChainToBase, CI->getOperand(0));
+      }
+
+      if (FreezeInst *Freeze = dyn_cast<FreezeInst>(CurrentValue)) {
+        ChainToBase.push_back(Freeze);
+        return Self(Self, ChainToBase, Freeze->getOperand(0));
+      }
+
+      return CurrentValue;
+    };
+    Value *RootOfChain =
+        FindPointerChainToBase(FindPointerChainToBase, Record.ChainToBase,
+                               Derived);
+    if (RootOfChain != Base || Record.ChainToBase.empty()) {
+      if (DebugOxCamlDerivedRemat && IsOxCamlStatepoint) {
+        errs() << "  root-of-chain: ";
+        RootOfChain->print(errs());
+        errs() << "\n  chain-size: " << Record.ChainToBase.size() << "\n";
+      }
+      return Reject("not-chain");
+    }
+
+    const unsigned Ordinal = ++OxCamlDerivedRematAcceptedOrdinal;
+    const unsigned Skip = RematAddrSpace1DerivedFromBaseAtAllocSkip;
+    const unsigned Limit = RematAddrSpace1DerivedFromBaseAtAllocLimit;
+    if (Ordinal <= Skip || Ordinal - Skip > Limit) {
+      if (DebugOxCamlDerivedRemat) {
+        errs() << "rs4gc-oxcaml-remat-reject range ordinal " << Ordinal
+               << "\n";
+      }
+      return false;
+    }
+
+    Record.RootOfChain = RootOfChain;
+    Record.Cost = 0;
+    RematerializedDerivedChains.insert({Derived, Record});
+    if (DebugOxCamlDerivedRemat) {
+      errs() << "rs4gc-oxcaml-remat-accepted ordinal " << Ordinal << " in "
+             << Call->getFunction()->getName() << "\n  derived: ";
+      Derived->print(errs());
+      errs() << "\n  base: ";
+      Base->print(errs());
+      errs() << "\n";
+    }
+    return true;
+  };
+
+  SmallVector<Value *, 64> FilteredLiveVariables;
+  SmallVector<Value *, 64> FilteredBasePtrs;
+  for (size_t I = 0; I < LiveVariables.size(); ++I) {
+    Value *LiveVariable = LiveVariables[I];
+    if (DebugOxCamlDerivedRemat && IsOxCamlStatepoint) {
+      auto BaseIt = PointerToBase.find(LiveVariable);
+      if (BaseIt != PointerToBase.end())
+        PrintOxCamlDerivedCandidate(LiveVariable, BaseIt->second);
+    }
+    if (ShouldRematerializeDerivedFromBase(LiveVariable)) {
+      RematerializedDerivedValues.insert(LiveVariable);
+      continue;
+    }
+    FilteredLiveVariables.push_back(LiveVariable);
+    FilteredBasePtrs.push_back(BasePtrs[I]);
+  }
+
+  SmallVector<Value *, 16> GCArgsStorage(FilteredLiveVariables.begin(),
+                                         FilteredLiveVariables.end());
   if (auto Bundle = Call->getOperandBundle(LLVMContext::OB_gc_live))
-    for (const Use &U : Bundle->Inputs)
-      GCArgsStorage.push_back(U.get());
+    for (const Use &U : Bundle->Inputs) {
+      if (!RematerializedDerivedValues.contains(U.get()))
+        GCArgsStorage.push_back(U.get());
+    }
   ArrayRef<Value *> GCArgs(GCArgsStorage);
   uint64_t StatepointID = StatepointDirectives::DefaultStatepointID;
   uint32_t NumPatchBytes = 0;
@@ -1930,7 +2104,8 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
     Instruction *ExceptionalToken = UnwindBlock->getLandingPadInst();
     Result.UnwindToken = ExceptionalToken;
 
-    CreateGCRelocates(LiveVariables, BasePtrs, ExceptionalToken, Builder);
+    CreateGCRelocates(FilteredLiveVariables, FilteredBasePtrs,
+                      ExceptionalToken, Builder);
 
     // Generate gc relocates and returns for normal block
     BasicBlock *NormalDest = II->getNormalDest();
@@ -1944,6 +2119,34 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
     // statepoint
   }
   assert(Token && "Should be set in one of the above branches!");
+
+  auto AddDerivedRematerializations = [&](Instruction *StatepointToken) {
+    if (RematerializedDerivedValues.empty())
+      return;
+
+    DenseMap<Value *, GCRelocateInst *> RelocByDerived;
+    for (User *U : StatepointToken->users())
+      if (auto *Relocate = dyn_cast<GCRelocateInst>(U))
+        RelocByDerived[Relocate->getDerivedPtr()] = Relocate;
+
+    for (Value *Derived : RematerializedDerivedValues) {
+      Value *Base = PointerToBase.find(Derived)->second;
+      auto It = RelocByDerived.find(Base);
+      assert(It != RelocByDerived.end() &&
+             "base must be relocated to rematerialize derived pointer");
+      auto *BaseRelocate = It->second;
+      assert(BaseRelocate->getNextNode() &&
+             "gc.relocate should not be a terminator");
+
+      RematerizlizationCandidateRecord &Record =
+          RematerializedDerivedChains.find(Derived)->second;
+      Instruction *RematerializedValue =
+          rematerializeChain(Record.ChainToBase, BaseRelocate->getNextNode(),
+                             Record.RootOfChain, BaseRelocate);
+      Result.RematerializedValues[RematerializedValue] =
+          Derived;
+    }
+  };
 
   if (IsDeoptimize) {
     // If we're wrapping an @llvm.experimental.deoptimize in a statepoint, we
@@ -1976,7 +2179,8 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
   Result.StatepointToken = Token;
 
   // Second, create a gc.relocate for every live variable
-  CreateGCRelocates(LiveVariables, BasePtrs, Token, Builder);
+  CreateGCRelocates(FilteredLiveVariables, FilteredBasePtrs, Token, Builder);
+  AddDerivedRematerializations(Token);
 }
 
 // Replace an existing gc.statepoint with a new one and a set of gc.relocates
@@ -2318,7 +2522,7 @@ static void findLiveReferences(
 // Helper function for the "rematerializeLiveValues". It walks use chain
 // starting from the "CurrentValue" until it reaches the root of the chain, i.e.
 // the base or a value it cannot process. Only "simple" values are processed
-// (currently it is GEP's and casts). The returned root is  examined by the
+// (currently it is GEP's and casts). The returned root is examined by the
 // callers of findRematerializableChainToBasePointer.  Fills "ChainToBase" array
 // with all visited values.
 static Value* findRematerializableChainToBasePointer(
