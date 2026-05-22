@@ -1156,7 +1156,13 @@ void SelectionDAGBuilder::LowerCallSiteWithDeoptBundleImpl(
   SI.StatepointFlags = static_cast<uint64_t>(StatepointFlags::None);
   SI.EHPadBB = EHPadBB;
 
-  // NB! The GC arguments are deliberately left empty.
+  if (auto GCLiveBundle = Call->getOperandBundle(LLVMContext::OB_gc_live)) {
+    for (const Use &U : GCLiveBundle->Inputs) {
+      Value *V = U.get();
+      SI.Bases.push_back(V);
+      SI.Ptrs.push_back(V);
+    }
+  }
 
   if (SDValue ReturnVal = LowerAsSTATEPOINT(SI)) {
     ReturnVal = lowerRangeToAssertZExt(DAG, *Call, ReturnVal);

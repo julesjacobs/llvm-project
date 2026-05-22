@@ -478,7 +478,11 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
   unsigned NumAllocas = MOI->getImm();
   ++MOI;
   while (NumAllocas--) {
+    const auto Before = Locations.size();
     MOI = parseOperand(MOI, MOE, Locations, LiveOuts);
+    for (auto I = Locations.begin() + Before, E = Locations.end(); I != E;
+         ++I)
+      GCLocations.push_back(*I);
     assert(MOI < MOE);
   }
 }

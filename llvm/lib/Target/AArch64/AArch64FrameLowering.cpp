@@ -2778,6 +2778,15 @@ static void computeCalleeSaveRegisterPairs(
     if (NeedsFrameRecord && AFI->hasSwiftAsyncContext() &&
         RPI.Reg2 == AArch64::FP)
       Offset += 8;
+
+    // OxCaml no-FP frames are walked from the stack pointer and expect the
+    // saved return address at the top word of the fixed frame.  When LR is the
+    // only callee-save register, the frame is still 16-byte aligned, so place
+    // LR at SP+8 rather than in the padding word at SP.
+    if (CC == CallingConv::OxCaml_WithoutFP && !NeedsFrameRecord &&
+        !RPI.isPaired() && RPI.Reg1 == AArch64::LR &&
+        RPI.Type == RegPairInfo::GPR && Offset == 0)
+      Offset += 8;
     RPI.Offset = Offset / Scale;
 
     assert(((!RPI.isScalable() && RPI.Offset >= -64 && RPI.Offset <= 63) ||
