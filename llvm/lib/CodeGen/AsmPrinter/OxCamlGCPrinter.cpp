@@ -33,6 +33,7 @@
 #include <cctype>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -607,7 +608,11 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
       // Stack offset from OxCaml for active trap blocks and explicit stack
       // adjustments. LLVM does not model this as part of the static frame size
       // consistently across call sites, so apply the OxCaml offset directly.
-      FrameSize += stackOffsetOfID(CSI.ID);
+      uint64_t StackOffset = stackOffsetOfID(CSI.ID);
+      bool HasDynamicFrameSize =
+          CSI.CSFunctionInfo.StackSize == std::numeric_limits<uint64_t>::max();
+      if (!IsAArch64 || HasDynamicFrameSize)
+        FrameSize += StackOffset;
 
       if (FrameSize & FrameSizeReservedMask) {
         report_fatal_error("[OxCamlGCPrinter] frame size has bottom bits set: "
