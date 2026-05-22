@@ -315,9 +315,21 @@ public:
     uint64_t StackSize = 0;
     uint64_t RecordCount = 1;
 
+    struct CSRRootMapEntry {
+      unsigned DwarfRegNum = 0;
+      int64_t Offset = 0;
+
+      CSRRootMapEntry() = default;
+      CSRRootMapEntry(unsigned DwarfRegNum, int64_t Offset)
+          : DwarfRegNum(DwarfRegNum), Offset(Offset) {}
+    };
+    SmallVector<CSRRootMapEntry, 8> CSRRootMap;
+
     FunctionInfo() = default;
-    explicit FunctionInfo(uint64_t StaticStackSize, uint64_t StackSize)
-      : StaticStackSize(StaticStackSize), StackSize(StackSize) {}
+    explicit FunctionInfo(uint64_t StaticStackSize, uint64_t StackSize,
+                          SmallVector<CSRRootMapEntry, 8> CSRRootMap = {})
+        : StaticStackSize(StaticStackSize), StackSize(StackSize),
+          CSRRootMap(std::move(CSRRootMap)) {}
   };
 
   struct CallsiteInfo {
@@ -401,6 +413,10 @@ private:
   /// Parse the register live-out mask and return a vector of live-out
   /// registers that need to be recorded in the stackmap.
   LiveOutVec parseRegisterLiveOutMask(const uint32_t *Mask) const;
+
+  /// Record stack size and callee-save spill locations for the current
+  /// function.
+  FunctionInfo getFunctionInfo() const;
 
   /// Record the locations of the operands of the provided instruction in a
   /// record keyed by the provided label.  For instructions w/AnyReg calling

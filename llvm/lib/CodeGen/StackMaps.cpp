@@ -15,6 +15,7 @@
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/CodeGen/MachineInstr.h"
 #include "llvm/CodeGen/MachineOperand.h"
+#include "llvm/CodeGen/TargetFrameLowering.h"
 #include "llvm/CodeGen/TargetOpcodes.h"
 #include "llvm/CodeGen/TargetRegisterInfo.h"
 #include "llvm/CodeGen/TargetSubtargetInfo.h"
@@ -402,6 +403,44 @@ StackMaps::parseRegisterLiveOutMask(const uint32_t *Mask) const {
   return LiveOuts;
 }
 
+static bool isAArch64OxCamlCSR(unsigned DwarfRegNum) {
+  return 19 <= DwarfRegNum && DwarfRegNum <= 25;
+}
+
+StackMaps::FunctionInfo StackMaps::getFunctionInfo() const {
+  const MachineFrameInfo &MFI = AP.MF->getFrameInfo();
+  const TargetRegisterInfo *RegInfo = AP.MF->getSubtarget().getRegisterInfo();
+  const TargetSubtargetInfo &STI = AP.MF->getSubtarget();
+  const TargetFrameLowering *TFI = STI.getFrameLowering();
+  bool HasDynamicFrameSize =
+      MFI.hasVarSizedObjects() || RegInfo->hasStackRealignment(*(AP.MF));
+  uint64_t StaticFrameSize = MFI.getStackSize();
+  uint64_t FrameSize = HasDynamicFrameSize ? UINT64_MAX : StaticFrameSize;
+
+  SmallVector<FunctionInfo::CSRRootMapEntry, 8> CSRRootMap;
+  if (MFI.isCalleeSavedInfoValid()) {
+    for (const CalleeSavedInfo &CSI : MFI.getCalleeSavedInfo()) {
+      if (CSI.isSpilledToReg())
+        continue;
+
+      unsigned DwarfRegNum = getDwarfRegNum(CSI.getReg(), RegInfo);
+      if (!isAArch64OxCamlCSR(DwarfRegNum))
+        continue;
+
+      Register FrameReg;
+      StackOffset Offset = TFI->getFrameIndexReferencePreferSP(
+          *AP.MF, CSI.getFrameIdx(), FrameReg, /*IgnoreSPUpdates=*/false);
+      (void)FrameReg;
+      if (Offset.getScalable() != 0)
+        continue;
+
+      CSRRootMap.emplace_back(DwarfRegNum, Offset.getFixed());
+    }
+  }
+
+  return FunctionInfo(StaticFrameSize, FrameSize, std::move(CSRRootMap));
+}
+
 // See statepoint MI format description in StatepointOpers' class comment
 // in include/llvm/CodeGen/StackMaps.h
 void StackMaps::parseStatepointOpers(const MachineInstr &MI,
@@ -540,23 +579,19 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
       MCSymbolRefExpr::create(&MILabel, OutContext),
       MCSymbolRefExpr::create(AP.CurrentFnSymForSize, OutContext), OutContext);
 
-  // Record the stack size of the current function and update callsite count.
-  const MachineFrameInfo &MFI = AP.MF->getFrameInfo();
-  const TargetRegisterInfo *RegInfo = AP.MF->getSubtarget().getRegisterInfo();
-  bool HasDynamicFrameSize =
-      MFI.hasVarSizedObjects() || RegInfo->hasStackRealignment(*(AP.MF));
-  uint64_t StaticFrameSize = MFI.getStackSize();
-  uint64_t FrameSize =  HasDynamicFrameSize ? UINT64_MAX : StaticFrameSize;
+  // Record the stack size and CSR root map of the current function, then
+  // update callsite count.
+  FunctionInfo CurrentFunctionInfo = getFunctionInfo();
 
   auto CurrentIt = FnInfos.find(AP.CurrentFnSym);
   if (CurrentIt != FnInfos.end())
     CurrentIt->second.RecordCount++;
   else
     FnInfos.insert(std::make_pair(AP.CurrentFnSym,
-      FunctionInfo(StaticFrameSize, FrameSize)));
+                                  CurrentFunctionInfo));
 
   CSInfos.emplace_back(&MILabel, CSOffsetExpr,
-                       FunctionInfo(StaticFrameSize, FrameSize),
+                       CurrentFunctionInfo,
                        ID, AP.MF->getFunction().getName().str(),
                        std::move(Locations), HasGCLocations,
                        std::move(GCLocations), std::move(LiveOuts));

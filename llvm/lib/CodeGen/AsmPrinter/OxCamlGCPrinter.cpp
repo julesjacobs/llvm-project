@@ -669,6 +669,7 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     // num_live
     const auto &RootLocations =
         CSI.HasGCLocations ? CSI.GCLocations : CSI.Locations;
+    const auto &CSRRootMap = CSI.CSFunctionInfo.CSRRootMap;
 
     uint64_t LiveCount = 0;
     for (const auto &Loc : RootLocations) {
@@ -678,12 +679,13 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
         LiveCount++;
       }
     }
-    if (LiveCount >= 1 << 16) {
+    bool HasCSRMap = !CSRRootMap.empty();
+    if (LiveCount >= (HasCSRMap ? (1 << 15) : (1 << 16))) {
       // Very rude!
       report_fatal_error("[OxCamlGCPrinter] live count requires long frames: "
         + Twine(LiveCount));
     }
-    OS.emitInt16(LiveCount);
+    OS.emitInt16(LiveCount | (HasCSRMap ? (1 << 15) : 0));
 
     // live_ofs
     for (const auto &Loc : RootLocations) {
@@ -703,6 +705,23 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
         emitStackOffset(OS, FrameSize, PtrSize, Loc.Offset);
       } else {
         // TODO: Do we need anything else here?
+      }
+    }
+
+    if (HasCSRMap) {
+      if (CSRRootMap.size() >= 1 << 16)
+        report_fatal_error("[OxCamlGCPrinter] CSR root map too large: " +
+                           Twine(CSRRootMap.size()));
+      OS.emitInt16(CSRRootMap.size());
+      for (const auto &Entry : CSRRootMap) {
+        unsigned OxCamlIndex = mapLLVMDwarfRegToOxCamlIndex(
+            M, Entry.DwarfRegNum);
+        if (OxCamlIndex >= 1 << 16)
+          report_fatal_error("[OxCamlGCPrinter] CSR root register index too "
+                             "large: " +
+                             Twine(OxCamlIndex));
+        OS.emitInt16(OxCamlIndex);
+        emitStackOffset(OS, FrameSize, PtrSize, Entry.Offset);
       }
     }
 
