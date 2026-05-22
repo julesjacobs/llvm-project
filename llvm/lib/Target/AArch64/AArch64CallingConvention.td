@@ -176,7 +176,10 @@ def RetCC_AArch64_OxCaml : CallingConv<[
   CCIfType<[f32], CCAssignToReg<[S0, S1, S2, S3, S4, S5, S6, S7,
                                  S8, S9, S10, S11, S12, S13, S14, S15]>>,
   CCIfType<[f64], CCAssignToReg<[D0, D1, D2, D3, D4, D5, D6, D7,
-                                 D8, D9, D10, D11, D12, D13, D14, D15]>>
+                                 D8, D9, D10, D11, D12, D13, D14, D15]>>,
+  CCIfType<[f128, v2i64, v4i32, v8i16, v16i8, v4f32, v2f64, v8f16, v8bf16],
+    CCAssignToReg<[Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7,
+                   Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15]>>
 ]>;
 
 def RetCC_AArch64_OxCaml_C_Call : CallingConv<[
@@ -430,8 +433,13 @@ def CC_AArch64_OxCaml : CallingConv<[
                                  S8, S9, S10, S11, S12, S13, S14, S15]>>,
   CCIfType<[f64], CCAssignToReg<[D0, D1, D2, D3, D4, D5, D6, D7,
                                  D8, D9, D10, D11, D12, D13, D14, D15]>>,
+  CCIfType<[f128, v2i64, v4i32, v8i16, v16i8, v4f32, v2f64, v8f16, v8bf16],
+    CCAssignToReg<[Q0, Q1, Q2, Q3, Q4, Q5, Q6, Q7,
+                   Q8, Q9, Q10, Q11, Q12, Q13, Q14, Q15]>>,
 
-  CCIfType<[i64, f32, f64], CCAssignToStack<8, 8>>
+  CCIfType<[i64, f32, f64], CCAssignToStack<8, 8>>,
+  CCIfType<[f128, v2i64, v4i32, v8i16, v16i8, v4f32, v2f64, v8f16, v8bf16],
+    CCAssignToStack<16, 16>>
 ]>;
 
 def CC_AArch64_OxCaml_C_Call : CallingConv<[
