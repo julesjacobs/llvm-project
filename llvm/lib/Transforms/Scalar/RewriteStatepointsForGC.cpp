@@ -444,6 +444,10 @@ static void setKnownBase(Value *V, bool IsKnownBase,
 static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
                                     IsKnownBaseMapTy &KnownBases);
 
+static Value *findAddrSpace1IntBaseDefiningValue(Value *I,
+                                                 DefiningValueMapTy &Cache,
+                                                 IsKnownBaseMapTy &KnownBases);
+
 /// Return a base defining value for the 'Index' element of the given vector
 /// instruction 'I'.  If Index is null, returns a BDV for the entire vector
 /// 'I'.  As an optimization, this method will try to determine when the
@@ -593,12 +597,19 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
     return CPN;
   }
 
-  // inttoptrs in an integral address space are currently ill-defined.  We
-  // treat them as defining base pointers here for consistency with the
-  // constant rule above and because we don't really have a better semantic
-  // to give them.  Note that the optimizer is always free to insert undefined
-  // behavior on dynamically dead paths as well.
-  if (isa<IntToPtrInst>(I)) {
+  if (auto *I2P = dyn_cast<IntToPtrInst>(I)) {
+    if (cast<PointerType>(I2P->getType())->getAddressSpace() == 1)
+      if (auto *BDV = findAddrSpace1IntBaseDefiningValue(I2P->getOperand(0),
+                                                         Cache, KnownBases)) {
+        Cache[I2P] = BDV;
+        return BDV;
+      }
+
+    // inttoptrs in an integral address space are currently ill-defined.  We
+    // treat them as defining base pointers here for consistency with the
+    // constant rule above and because we don't really have a better semantic
+    // to give them.  Note that the optimizer is always free to insert undefined
+    // behavior on dynamically dead paths as well.
     Cache[I] = I;
     setKnownBase(I, /* IsKnownBase */true, KnownBases);
     return I;
@@ -736,6 +747,34 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
   assert((isa<SelectInst>(I) || isa<PHINode>(I)) &&
          "missing instruction case in findBaseDefiningValue");
   return I;
+}
+
+static Value *findAddrSpace1IntBaseDefiningValue(Value *I,
+                                                 DefiningValueMapTy &Cache,
+                                                 IsKnownBaseMapTy &KnownBases) {
+  if (auto *P2I = dyn_cast<PtrToIntInst>(I)) {
+    Value *Ptr = P2I->getOperand(0);
+    auto *PtrTy = dyn_cast<PointerType>(Ptr->getType());
+    if (!PtrTy || PtrTy->getAddressSpace() != 1)
+      return nullptr;
+    return findBaseDefiningValue(Ptr, Cache, KnownBases);
+  }
+
+  auto *BO = dyn_cast<BinaryOperator>(I);
+  if (!BO || (BO->getOpcode() != Instruction::Add &&
+              BO->getOpcode() != Instruction::Sub))
+    return nullptr;
+
+  if (isa<ConstantInt>(BO->getOperand(1)))
+    return findAddrSpace1IntBaseDefiningValue(BO->getOperand(0), Cache,
+                                              KnownBases);
+
+  if (BO->getOpcode() == Instruction::Add &&
+      isa<ConstantInt>(BO->getOperand(0)))
+    return findAddrSpace1IntBaseDefiningValue(BO->getOperand(1), Cache,
+                                              KnownBases);
+
+  return nullptr;
 }
 
 /// Returns the base defining value for this value.
@@ -1466,12 +1505,13 @@ static Instruction *rematerializeChain(ArrayRef<Instruction *> ChainToBase,
   // Walk backwards to visit top-most instructions first.
   for (Instruction *Instr :
        make_range(ChainToBase.rbegin(), ChainToBase.rend())) {
-    // Only GEP's, casts, and freezes are supported as we need to be careful
-    // to not introduce any new uses of pointers not in the liveset.
+    // Only GEP's, casts, freezes, and simple pointer/integer address
+    // arithmetic are supported as we need to be careful to not introduce any
+    // new uses of pointers not in the liveset.
     // Note that it's fine to introduce new uses of pointers which were
     // otherwise not used after this statepoint.
     assert(isa<GetElementPtrInst>(Instr) || isa<CastInst>(Instr) ||
-           isa<FreezeInst>(Instr));
+           isa<FreezeInst>(Instr) || isa<BinaryOperator>(Instr));
 
     Instruction *ClonedValue = Instr->clone();
     ClonedValue->insertBefore(InsertBefore);
@@ -1804,12 +1844,41 @@ makeStatepointExplicitImpl(CallBase *Call, /* to replace */
       }
 
       if (CastInst *CI = dyn_cast<CastInst>(CurrentValue)) {
-        if (!CI->getOperand(0)->getType()->isPtrOrPtrVectorTy() ||
-            !CI->isNoopCast(CI->getModule()->getDataLayout()))
+        auto *IntToPtrDstTy = dyn_cast<PointerType>(CI->getType());
+        auto *PtrToIntSrcTy =
+            dyn_cast<PointerType>(CI->getOperand(0)->getType());
+        bool IsAddrSpace1IntToPtr =
+            isa<IntToPtrInst>(CI) && IntToPtrDstTy &&
+            IntToPtrDstTy->getAddressSpace() == 1;
+        bool IsAddrSpace1PtrToInt =
+            isa<PtrToIntInst>(CI) && PtrToIntSrcTy &&
+            PtrToIntSrcTy->getAddressSpace() == 1;
+        if (!IsAddrSpace1IntToPtr && !IsAddrSpace1PtrToInt &&
+            (!CI->getOperand(0)->getType()->isPtrOrPtrVectorTy() ||
+             !CI->isNoopCast(CI->getModule()->getDataLayout())))
           return CI;
 
         ChainToBase.push_back(CI);
         return Self(Self, ChainToBase, CI->getOperand(0));
+      }
+
+      if (auto *BO = dyn_cast<BinaryOperator>(CurrentValue)) {
+        if (BO->getOpcode() != Instruction::Add &&
+            BO->getOpcode() != Instruction::Sub)
+          return BO;
+
+        if (isa<ConstantInt>(BO->getOperand(1))) {
+          ChainToBase.push_back(BO);
+          return Self(Self, ChainToBase, BO->getOperand(0));
+        }
+
+        if (BO->getOpcode() == Instruction::Add &&
+            isa<ConstantInt>(BO->getOperand(0))) {
+          ChainToBase.push_back(BO);
+          return Self(Self, ChainToBase, BO->getOperand(1));
+        }
+
+        return BO;
       }
 
       if (FreezeInst *Freeze = dyn_cast<FreezeInst>(CurrentValue)) {
