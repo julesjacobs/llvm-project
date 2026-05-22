@@ -327,16 +327,21 @@ public:
     uint64_t ID = 0;
     std::string FunctionName;
     LocationVec Locations;
+    bool HasGCLocations = false;
+    LocationVec GCLocations;
     LiveOutVec LiveOuts;
 
     CallsiteInfo() = default;
     CallsiteInfo(const MCSymbol *CSLabel, const MCExpr *CSOffsetExpr,
                  const FunctionInfo CSFunctionInfo, uint64_t ID,
                  std::string FunctionName, LocationVec &&Locations,
+                 bool HasGCLocations, LocationVec &&GCLocations,
                  LiveOutVec &&LiveOuts)
         : CSLabel(CSLabel), CSOffsetExpr(CSOffsetExpr),
           CSFunctionInfo(CSFunctionInfo), ID(ID),
           FunctionName(std::move(FunctionName)), Locations(std::move(Locations)),
+          HasGCLocations(HasGCLocations),
+          GCLocations(std::move(GCLocations)),
           LiveOuts(std::move(LiveOuts)) {}
   };
 
@@ -386,7 +391,8 @@ private:
   void parseStatepointOpers(const MachineInstr &MI,
                             MachineInstr::const_mop_iterator MOI,
                             MachineInstr::const_mop_iterator MOE,
-                            LocationVec &Locations, LiveOutVec &LiveOuts);
+                            LocationVec &Locations, bool &HasGCLocations,
+                            LocationVec &GCLocations, LiveOutVec &LiveOuts);
 
   /// Create a live-out register record for the given register @p Reg.
   LiveOutReg createLiveOutReg(unsigned Reg,

@@ -442,6 +442,10 @@ bool AArch64FrameLowering::hasFP(const MachineFunction &MF) const {
   // Retain behavior of always omitting the FP for leaf functions when possible.
   if (MF.getTarget().Options.DisableFramePointerElim(MF))
     return true;
+  // The OCaml stack walker finds the return address from the current stack
+  // pointer. A platform frame-pointer prologue stores it elsewhere.
+  if (IsOxCamlCallingConv)
+    return false;
   if (MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken() ||
       (!IsOxCamlCallingConv && (MFI.hasStackMap() || MFI.hasPatchPoint())) ||
       RegInfo->hasStackRealignment(MF))

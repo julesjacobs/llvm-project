@@ -408,8 +408,11 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
                                      MachineInstr::const_mop_iterator MOI,
                                      MachineInstr::const_mop_iterator MOE,
                                      LocationVec &Locations,
+                                     bool &HasGCLocations,
+                                     LocationVec &GCLocations,
                                      LiveOutVec &LiveOuts) {
   LLVM_DEBUG(dbgs() << "record statepoint : " << MI << "\n");
+  HasGCLocations = true;
   StatepointOpers SO(&MI);
   MOI = parseOperand(MOI, MOE, Locations, LiveOuts); // CC
   MOI = parseOperand(MOI, MOE, Locations, LiveOuts); // Flags
@@ -458,7 +461,11 @@ void StackMaps::parseStatepointOpers(const MachineInstr &MI,
       // The stackmap consumer for OxCaml frame tables can only expose base
       // OCaml values to the runtime GC. Derived pointers remain available to
       // gc.relocate, but must not be scanned as independent roots.
+      const auto Before = Locations.size();
       (void)parseOperand(MOB + BaseIdx, MOE, Locations, LiveOuts);
+      for (auto I = Locations.begin() + Before, E = Locations.end(); I != E;
+           ++I)
+        GCLocations.push_back(*I);
     }
 
     MOI = MOB + GCPtrIdx;
@@ -484,6 +491,8 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
   MCContext &OutContext = AP.OutStreamer->getContext();
 
   LocationVec Locations;
+  bool HasGCLocations = false;
+  LocationVec GCLocations;
   LiveOutVec LiveOuts;
 
   if (recordResult) {
@@ -494,7 +503,8 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
 
   // Parse operands.
   if (MI.getOpcode() == TargetOpcode::STATEPOINT)
-    parseStatepointOpers(MI, MOI, MOE, Locations, LiveOuts);
+    parseStatepointOpers(MI, MOI, MOE, Locations, HasGCLocations, GCLocations,
+                         LiveOuts);
   else
     while (MOI != MOE)
       MOI = parseOperand(MOI, MOE, Locations, LiveOuts);
@@ -544,7 +554,8 @@ void StackMaps::recordStackMapOpers(const MCSymbol &MILabel,
   CSInfos.emplace_back(&MILabel, CSOffsetExpr,
                        FunctionInfo(StaticFrameSize, FrameSize),
                        ID, AP.MF->getFunction().getName().str(),
-                       std::move(Locations), std::move(LiveOuts));
+                       std::move(Locations), HasGCLocations,
+                       std::move(GCLocations), std::move(LiveOuts));
 }
 
 void StackMaps::recordStackMap(const MCSymbol &L, const MachineInstr &MI) {

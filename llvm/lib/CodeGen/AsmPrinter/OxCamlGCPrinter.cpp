@@ -582,8 +582,11 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     OS.emitInt16(FrameData);
 
     // num_live
+    const auto &RootLocations =
+        CSI.HasGCLocations ? CSI.GCLocations : CSI.Locations;
+
     uint64_t LiveCount = 0;
-    for (const auto &Loc : CSI.Locations) {
+    for (const auto &Loc : RootLocations) {
       if (Loc.Type == StackMaps::Location::Register ||
           Loc.Type == StackMaps::Location::Direct ||
           Loc.Type == StackMaps::Location::Indirect) {
@@ -598,7 +601,7 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     OS.emitInt16(LiveCount);
 
     // live_ofs
-    for (const auto &Loc : CSI.Locations) {
+    for (const auto &Loc : RootLocations) {
       if (Loc.Type == StackMaps::Location::Register) {
         // Register indices are tagged (2n+1) and follow the OxCaml register
         // map (see `mapLLVMDwarfRegToOxCamlIndex`)
