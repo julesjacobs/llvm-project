@@ -7638,7 +7638,8 @@ AArch64TargetLowering::LowerCall(CallLoweringInfo &CLI,
   } else
     Mask = TRI->getCallPreservedMask(MF, CallConv);
 
-  if (Subtarget->hasCustomCallingConv())
+  if (Subtarget->hasCustomCallingConv() &&
+      !(CLI.CB && CLI.CB->hasFnAttr("oxcaml-old-abi")))
     TRI->UpdateCustomCallPreservedMask(MF, &Mask);
 
   if (TRI->isAnyArgRegReserved(MF))
