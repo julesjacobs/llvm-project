@@ -556,7 +556,7 @@ def CSR_AArch64_AllRegs
 def CSR_AArch64_NoRegs : CalleeSavedRegs<(add)>;
 
 def CSR_AArch64_OxCaml_WithFP : CalleeSavedRegs<(add LR, FP)>;
-def CSR_AArch64_OxCaml_WithoutFP : CalleeSavedRegs<(add LR, FP)>;
+def CSR_AArch64_OxCaml_WithoutFP : CalleeSavedRegs<(add LR)>;
 def CSR_AArch64_OxCaml_C_Call : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X27, X28)>;
 def CSR_AArch64_OxCaml_C_Call_StackArgs
     : CalleeSavedRegs<(sub CSR_AArch64_AAPCS, X20, X21, X27, X28)>;

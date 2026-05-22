@@ -443,8 +443,11 @@ bool AArch64FrameLowering::hasFP(const MachineFunction &MF) const {
   if (MF.getTarget().Options.DisableFramePointerElim(MF))
     return true;
   // The OCaml stack walker finds the return address from the current stack
-  // pointer. A platform frame-pointer prologue stores it elsewhere.
-  if (IsOxCamlCallingConv)
+  // pointer. A platform frame-pointer prologue stores it elsewhere. Do not
+  // force this when LLVM still needs a stable base pointer for dynamic stack
+  // objects.
+  if (IsOxCamlCallingConv && !MFI.hasVarSizedObjects() &&
+      !MFI.isFrameAddressTaken() && !RegInfo->hasStackRealignment(MF))
     return false;
   if (MFI.hasVarSizedObjects() || MFI.isFrameAddressTaken() ||
       (!IsOxCamlCallingConv && (MFI.hasStackMap() || MFI.hasPatchPoint())) ||
