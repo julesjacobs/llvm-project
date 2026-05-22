@@ -109,6 +109,10 @@ static cl::opt<bool>
     AllowStatepointWithNoDeoptInfo("rs4gc-allow-statepoint-with-no-deopt-info",
                                    cl::Hidden, cl::init(true));
 
+static cl::opt<bool> TreatAddrSpace1PhiSelectAsBase(
+    "rs4gc-addrspace1-phi-select-base", cl::Hidden, cl::init(false),
+    cl::desc("Treat scalar addrspace(1) phi/select values as base pointers"));
+
 static cl::opt<bool> RematDerivedAtUses("rs4gc-remat-derived-at-uses",
                                         cl::Hidden, cl::init(true));
 
@@ -610,6 +614,14 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
     auto *BDV = findBaseDefiningValue(Freeze->getOperand(0), Cache, KnownBases);
     Cache[Freeze] = BDV;
     return BDV;
+  }
+
+  if (TreatAddrSpace1PhiSelectAsBase &&
+      (isa<PHINode>(I) || isa<SelectInst>(I)) &&
+      cast<PointerType>(I->getType())->getAddressSpace() == 1) {
+    Cache[I] = I;
+    setKnownBase(I, /* IsKnownBase */true, KnownBases);
+    return I;
   }
 
   if (IntrinsicInst *II = dyn_cast<IntrinsicInst>(I)) {
