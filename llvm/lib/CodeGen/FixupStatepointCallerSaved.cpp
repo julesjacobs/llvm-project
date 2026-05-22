@@ -581,7 +581,15 @@ public:
                       << MI.getParent()->getName() << " : process statepoint "
                       << MI);
     CallingConv::ID CC = SO.getCallingConv();
-    const uint32_t *Mask = TRI.getCallPreservedMask(MF, CC);
+    const uint32_t *Mask = nullptr;
+    for (const MachineOperand &MO : MI.operands()) {
+      if (MO.isRegMask()) {
+        Mask = MO.getRegMask();
+        break;
+      }
+    }
+    if (!Mask)
+      Mask = TRI.getCallPreservedMask(MF, CC);
     StatepointState SS(MI, Mask, CacheFI, AllowGCPtrInCSR);
     CacheFI.reset(SS.getEHPad());
 
