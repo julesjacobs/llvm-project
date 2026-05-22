@@ -542,6 +542,12 @@ static Value *findBaseDefiningValue(Value *I, DefiningValueMapTy &Cache,
   }
 
   if (isa<Constant>(I)) {
+    if (cast<PointerType>(I->getType())->getAddressSpace() == 1) {
+      Cache[I] = I;
+      setKnownBase(I, /* IsKnownBase */true, KnownBases);
+      return I;
+    }
+
     // We assume that objects with a constant base (e.g. a global) can't move
     // and don't need to be reported to the collector because they are always
     // live. Besides global references, all kinds of constants (e.g. undef,
