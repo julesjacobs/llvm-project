@@ -2471,13 +2471,15 @@ static void relocationViaAlloca(
     // PERF: trade a linear scan for repeated reallocation
     Uses.reserve(Def->getNumUses());
     for (User *U : Def->users()) {
-      if (!isa<ConstantExpr>(U)) {
-        // If the def has a ConstantExpr use, then the def is either a
-        // ConstantExpr use itself or null.  In either case
-        // (recursively in the first, directly in the second), the oop
-        // it is ultimately dependent on is null and this particular
-        // use does not need to be fixed up.
-        Uses.push_back(cast<Instruction>(U));
+      if (auto *I = dyn_cast<Instruction>(U)) {
+        Uses.push_back(I);
+      } else {
+        // If the def has a constant use, then the def is either a constant use
+        // itself or null.  In either case (recursively in the first, directly
+        // in the second), the oop it is ultimately dependent on is null and
+        // this particular use does not need to be fixed up.
+        assert(isa<Constant>(U) &&
+               "expected non-instruction user to be a constant");
       }
     }
 
