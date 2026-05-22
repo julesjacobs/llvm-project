@@ -192,6 +192,9 @@ static bool IDHasAlloc(uint64_t ID) {
 // Every 8-bit entry emitted in the frametable is offset by 2 (since that is the
 // min allocation size). So, every slot can represent allocations of size [2, 257]
 static uint8_t encodeAllocSize(uint64_t AllocSize) {
+  if (AllocSize < 2 || AllocSize > 257)
+    report_fatal_error("[OxCamlGCPrinter] invalid allocation size: "
+      + Twine(AllocSize));
   return AllocSize - 2;
 }
 
@@ -200,6 +203,8 @@ static const int DebugMask = 1;
 static const int FrameSizeReservedMask = 3; // Debug + Alloc
 static const int64_t OxCamlDebugDeoptMarker = 0x6f786364;
 static const int64_t OxCamlDebugDeoptVersion = 1;
+static const int64_t OxCamlAllocDeoptMarker = 0x6f786361;
+static const int64_t OxCamlAllocDeoptVersion = 1;
 
 struct OxCamlDebugItem {
   uint32_t Line = 0;
@@ -217,6 +222,16 @@ struct OxCamlDebugInfo {
   bool PrimitiveCall = false;
   bool RaiseCall = false;
   std::vector<OxCamlDebugItem> Items;
+};
+
+struct OxCamlAllocInfoItem {
+  uint64_t AllocWords = 0;
+  OxCamlDebugInfo DebugInfo;
+};
+
+struct OxCamlAllocInfo {
+  bool Valid = false;
+  std::vector<OxCamlAllocInfoItem> Items;
 };
 
 struct PendingDebugItem {
@@ -341,6 +356,54 @@ static OxCamlDebugInfo debugInfoForCallsite(
   }
 
   return OxCamlDebugInfo();
+}
+
+static OxCamlAllocInfo allocInfoForCallsite(
+    const StackMaps::CallsiteInfo &CSI) {
+  for (size_t I = 0; I < CSI.Locations.size(); ++I) {
+    const auto &Marker = CSI.Locations[I];
+    if (Marker.Type != StackMaps::Location::Constant ||
+        Marker.Offset != OxCamlAllocDeoptMarker) {
+      continue;
+    }
+
+    size_t Index = I + 1;
+    int64_t Version = 0;
+    int64_t NumAllocs = 0;
+    if (!readConstant(CSI, Index, Version) ||
+        Version != OxCamlAllocDeoptVersion ||
+        !readConstant(CSI, Index, NumAllocs) || NumAllocs < 0) {
+      continue;
+    }
+
+    OxCamlAllocInfo Info;
+    Info.Valid = true;
+
+    for (int64_t AllocIndex = 0; AllocIndex < NumAllocs; ++AllocIndex) {
+      int64_t AllocWords = 0;
+      int64_t NumDebugItems = 0;
+      if (!readConstant(CSI, Index, AllocWords) || AllocWords < 0 ||
+          !readConstant(CSI, Index, NumDebugItems) || NumDebugItems < 0)
+        return OxCamlAllocInfo();
+
+      OxCamlAllocInfoItem Item;
+      Item.AllocWords = static_cast<uint64_t>(AllocWords);
+      Item.DebugInfo.Valid = NumDebugItems > 0;
+
+      for (int64_t DebugIndex = 0; DebugIndex < NumDebugItems; ++DebugIndex) {
+        OxCamlDebugItem DebugItem;
+        if (!readDebugItem(CSI, Index, DebugItem))
+          return OxCamlAllocInfo();
+        Item.DebugInfo.Items.push_back(std::move(DebugItem));
+      }
+
+      Info.Items.push_back(std::move(Item));
+    }
+
+    return Info;
+  }
+
+  return OxCamlAllocInfo();
 }
 
 static std::vector<uint8_t> encodedAllocSizes(uint64_t AllocSize) {
@@ -554,15 +617,37 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     }
 
     OxCamlDebugInfo DebugInfo = debugInfoForCallsite(CSI);
+    OxCamlAllocInfo AllocInfo = allocInfoForCallsite(CSI);
     bool HasAlloc = CSI.ID != StatepointDirectives::DefaultStatepointID &&
                     IDHasAlloc(CSI.ID);
     uint64_t AllocSize = HasAlloc ? allocSizeOfID(CSI.ID) : 0;
-    std::vector<uint8_t> AllocSizes =
-        HasAlloc ? encodedAllocSizes(AllocSize) : std::vector<uint8_t>();
-    bool HasDebug = DebugInfo.Valid && (!HasAlloc || AllocSize != 0);
+    std::vector<uint8_t> AllocSizes;
+    if (HasAlloc && AllocInfo.Valid) {
+      for (const OxCamlAllocInfoItem &Item : AllocInfo.Items)
+        AllocSizes.push_back(encodeAllocSize(Item.AllocWords));
+    } else if (HasAlloc) {
+      AllocSizes = encodedAllocSizes(AllocSize);
+    }
+    bool HasAllocDebug = false;
+    if (HasAlloc && AllocInfo.Valid)
+      for (const OxCamlAllocInfoItem &Item : AllocInfo.Items)
+        HasAllocDebug |= Item.DebugInfo.Valid;
+    bool HasDebug = HasAlloc ? HasAllocDebug : DebugInfo.Valid;
 
     MCSymbol *DebugLabel = nullptr;
-    if (HasDebug) {
+    std::vector<MCSymbol *> AllocDebugLabels;
+    if (HasAlloc && HasAllocDebug) {
+      for (OxCamlAllocInfoItem &Item : AllocInfo.Items) {
+        if (Item.DebugInfo.Valid) {
+          MCSymbol *AllocDebugLabel = OS.getContext().createTempSymbol();
+          AllocDebugLabels.push_back(AllocDebugLabel);
+          PendingDebugInfos.push_back(
+              {AllocDebugLabel, std::move(Item.DebugInfo)});
+        } else {
+          AllocDebugLabels.push_back(nullptr);
+        }
+      }
+    } else if (HasDebug) {
       DebugLabel = OS.getContext().createTempSymbol();
       PendingDebugInfos.push_back({DebugLabel, std::move(DebugInfo)});
     }
@@ -634,9 +719,20 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
     }
 
     if (HasDebug) {
-      size_t NumDebugOffsets = HasAlloc ? AllocSizes.size() : 1;
-      for (size_t I = 0; I < NumDebugOffsets; ++I)
-        emitDebugOffset(OS, DebugLabel);
+      if (HasAlloc && HasAllocDebug) {
+        for (MCSymbol *AllocDebugLabel : AllocDebugLabels) {
+          if (AllocDebugLabel == nullptr) {
+            OS.emitValueToAlignment(Align(4));
+            OS.emitInt32(0);
+          } else {
+            emitDebugOffset(OS, AllocDebugLabel);
+          }
+        }
+      } else {
+        size_t NumDebugOffsets = HasAlloc ? AllocSizes.size() : 1;
+        for (size_t I = 0; I < NumDebugOffsets; ++I)
+          emitDebugOffset(OS, DebugLabel);
+      }
     }
 
     OS.emitValueToAlignment(Align(PtrSize));
