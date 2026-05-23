@@ -441,8 +441,8 @@ static bool isAArch64Target(const Module &M) {
          TheTriple.getArch() == Triple::aarch64_32;
 }
 
-static void emitStackOffset(MCStreamer &OS, uint64_t FrameSize,
-                            unsigned PtrSize, int64_t Offset) {
+static int64_t stackOffset(uint64_t FrameSize, unsigned PtrSize,
+                           int64_t Offset) {
   // BP-relative addressing -> SP
   if (Offset < 0) {
     int64_t TempFrameSize =
@@ -450,11 +450,14 @@ static void emitStackOffset(MCStreamer &OS, uint64_t FrameSize,
     Offset += TempFrameSize;
   }
 
+  return Offset;
+}
+
+static void checkShortStackOffset(int64_t Offset) {
   if (Offset < -(1 << 15) || Offset >= (1 << 15)) {
     report_fatal_error("[OxCamlGCPrinter] stack offset too large: "
       + Twine(Offset));
   }
-  OS.emitInt16(static_cast<uint16_t>(Offset));
 }
 
 static void emitDebugOffset(MCStreamer &OS, const MCSymbol *DebugLabel) {
@@ -666,50 +669,74 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
       FrameData |= DebugMask;
     }
 
-    if (FrameData >= 1 << 16)
-      report_fatal_error("[OxCamlGCPrinter] frame size requires long frames: "
-        + Twine(FrameData));
-    OS.emitInt16(FrameData);
-
     // num_live
     const auto &RootLocations =
         CSI.HasGCLocations ? CSI.GCLocations : CSI.Locations;
     const auto &CSRRootMap = CSI.CSFunctionInfo.CSRRootMap;
 
-    uint64_t LiveCount = 0;
-    for (const auto &Loc : RootLocations) {
-      if (Loc.Type == StackMaps::Location::Register ||
-          Loc.Type == StackMaps::Location::Direct ||
-          Loc.Type == StackMaps::Location::Indirect) {
-        LiveCount++;
-      }
-    }
-    bool HasCSRMap = !CSRRootMap.empty();
-    if (LiveCount >= (HasCSRMap ? (1 << 15) : (1 << 16))) {
-      // Very rude!
-      report_fatal_error("[OxCamlGCPrinter] live count requires long frames: "
-        + Twine(LiveCount));
-    }
-    OS.emitInt16(LiveCount | (HasCSRMap ? (1 << 15) : 0));
-
-    // live_ofs
+    std::vector<int64_t> LiveOffsets;
     for (const auto &Loc : RootLocations) {
       if (Loc.Type == StackMaps::Location::Register) {
         // Register indices are tagged (2n+1) and follow the OxCaml register
         // map (see `mapLLVMDwarfRegToOxCamlIndex`)
         unsigned DwarfRegNum = Loc.Reg;
         unsigned OxCamlIndex = mapLLVMDwarfRegToOxCamlIndex(M, DwarfRegNum);
-        uint16_t EncodedReg = (OxCamlIndex << 1) + 1;
-        OS.emitInt16(EncodedReg);
-      } else if (Loc.Type == StackMaps::Location::Direct) {
-        // Direct stack locations are explicit alloca roots passed through the
-        // statepoint. The live offset is the stack slot itself.
-        emitStackOffset(OS, FrameSize, PtrSize, Loc.Offset);
-      } else if (Loc.Type == StackMaps::Location::Indirect) {
-        // For spilled stack values, emit the offset directly.
-        emitStackOffset(OS, FrameSize, PtrSize, Loc.Offset);
+        LiveOffsets.push_back((OxCamlIndex << 1) + 1);
+      } else if (Loc.Type == StackMaps::Location::Direct ||
+                 Loc.Type == StackMaps::Location::Indirect) {
+        LiveOffsets.push_back(stackOffset(FrameSize, PtrSize, Loc.Offset));
       } else {
         // TODO: Do we need anything else here?
+      }
+    }
+
+    bool HasCSRMap = !CSRRootMap.empty();
+
+    static const uint64_t LongFrameMarker = 0x7fff;
+    bool IsLongFrame =
+        FrameData >= LongFrameMarker || LiveOffsets.size() >= LongFrameMarker;
+    for (int64_t Offset : LiveOffsets) {
+      if (Offset < 0 || Offset >= static_cast<int64_t>(LongFrameMarker)) {
+        IsLongFrame = true;
+        break;
+      }
+    }
+
+    if (IsLongFrame && HasCSRMap)
+      report_fatal_error("[OxCamlGCPrinter] CSR root maps with long frames "
+                         "are not supported");
+
+    if (IsLongFrame) {
+      if (FrameData >= (1ULL << 32))
+        report_fatal_error("[OxCamlGCPrinter] frame size too large: "
+          + Twine(FrameData));
+      if (LiveOffsets.size() >= (1ULL << 32))
+        report_fatal_error("[OxCamlGCPrinter] live count too large: "
+          + Twine(LiveOffsets.size()));
+
+      OS.emitInt16(LongFrameMarker);
+      OS.emitValueToAlignment(Align(4));
+      OS.emitInt32(static_cast<uint32_t>(FrameData));
+      OS.emitInt32(static_cast<uint32_t>(LiveOffsets.size()));
+      for (int64_t Offset : LiveOffsets) {
+        if (Offset < 0 || Offset >= (1LL << 32))
+          report_fatal_error("[OxCamlGCPrinter] live offset too large: "
+            + Twine(Offset));
+        OS.emitInt32(static_cast<uint32_t>(Offset));
+      }
+    } else {
+      if (LiveOffsets.size() >= (HasCSRMap ? (1 << 15) : (1 << 16))) {
+        // Very rude!
+        report_fatal_error("[OxCamlGCPrinter] live count requires long frames: "
+          + Twine(LiveOffsets.size()));
+      }
+
+      OS.emitInt16(static_cast<uint16_t>(FrameData));
+      OS.emitInt16(static_cast<uint16_t>(
+          LiveOffsets.size() | (HasCSRMap ? (1 << 15) : 0)));
+      for (int64_t Offset : LiveOffsets) {
+        checkShortStackOffset(Offset);
+        OS.emitInt16(static_cast<uint16_t>(Offset));
       }
     }
 
@@ -726,7 +753,9 @@ bool OxCamlGCMetadataPrinter::emitStackMaps(Module &M, StackMaps &SM, AsmPrinter
                              "large: " +
                              Twine(OxCamlIndex));
         OS.emitInt16(OxCamlIndex);
-        emitStackOffset(OS, FrameSize, PtrSize, Entry.Offset);
+        int64_t Offset = stackOffset(FrameSize, PtrSize, Entry.Offset);
+        checkShortStackOffset(Offset);
+        OS.emitInt16(static_cast<uint16_t>(Offset));
       }
     }
 
