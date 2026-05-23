@@ -1652,6 +1652,13 @@ void AArch64FrameLowering::emitPrologue(MachineFunction &MF,
     ++MBBI;
   }
 
+  if (!IsFunclet && !HasFP &&
+      F.getCallingConv() == CallingConv::OxCaml_WithFP) {
+    emitFrameOffset(MBB, MBBI, DL, AArch64::FP, AArch64::SP,
+                    StackOffset::getFixed(0), TII, MachineInstr::FrameSetup,
+                    false, NeedsWinCFI, &HasWinCFI);
+  }
+
   // For funclets the FP belongs to the containing function.
   if (!IsFunclet && HasFP) {
     // Only set up FP if we actually need to.

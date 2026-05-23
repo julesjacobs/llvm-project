@@ -77,6 +77,29 @@ cl::opt<unsigned> MaxRegistersForGCPointers(
 
 typedef FunctionLoweringInfo::StatepointRelocationRecord RecordType;
 
+static SDNode *findCallSeqEnd(SDNode *N, SmallPtrSetImpl<SDNode *> &Seen) {
+  if (!N || !Seen.insert(N).second)
+    return nullptr;
+
+  if (N->getOpcode() == ISD::CALLSEQ_END)
+    return N;
+
+  switch (N->getOpcode()) {
+  case ISD::CopyFromReg:
+  case ISD::LOAD:
+  case ISD::MERGE_VALUES:
+    return findCallSeqEnd(N->getOperand(0).getNode(), Seen);
+  case ISD::TokenFactor:
+    for (const SDValue &Op : N->ops()) {
+      if (SDNode *CallSeqEnd = findCallSeqEnd(Op.getNode(), Seen))
+        return CallSeqEnd;
+    }
+    return nullptr;
+  default:
+    return nullptr;
+  }
+}
+
 static void pushStackMapConstant(SmallVectorImpl<SDValue>& Ops,
                                  SelectionDAGBuilder &Builder, uint64_t Value) {
   SDLoc L = Builder.getCurSDLoc();
@@ -324,7 +347,6 @@ static std::pair<SDValue, SDNode *> lowerCallFromStatepointLoweringInfo(
   SDValue ReturnValue, CallEndVal;
   std::tie(ReturnValue, CallEndVal) =
       Builder.lowerInvokable(SI.CLI, SI.EHPadBB);
-  SDNode *CallEnd = CallEndVal.getNode();
 
   // Get a call instruction from the call sequence chain.  Tail calls are not
   // allowed.  The following code is essentially reverse engineering X86's
@@ -342,17 +364,19 @@ static std::pair<SDValue, SDNode *> lowerCallFromStatepointLoweringInfo(
   // to grab the return value from the return register(s), or it can be a LOAD
   // to load a value returned by reference via a stack slot.
 
-  bool HasDef = !SI.CLI.RetTy->isVoidTy();
-  if (HasDef) {
-    if (CallEnd->getOpcode() == ISD::LOAD)
-      CallEnd = CallEnd->getOperand(0).getNode();
-    else
-      while (CallEnd->getOpcode() == ISD::CopyFromReg)
-        CallEnd = CallEnd->getOperand(0).getNode();
-  }
+  SmallPtrSet<SDNode *, 8> Seen;
+  if (SDNode *CallEnd = findCallSeqEnd(CallEndVal.getNode(), Seen))
+    return std::make_pair(ReturnValue, CallEnd->getOperand(0).getNode());
 
-  assert(CallEnd->getOpcode() == ISD::CALLSEQ_END && "expected!");
-  return std::make_pair(ReturnValue, CallEnd->getOperand(0).getNode());
+  std::string NodeName;
+  raw_string_ostream OS(NodeName);
+  if (SDNode *N = CallEndVal.getNode())
+    OS << N->getOperationName(&Builder.DAG) << " (opcode " << N->getOpcode()
+       << ")";
+  else
+    OS << "<null>";
+  report_fatal_error(Twine("Could not find call sequence end while lowering "
+                           "statepoint; stopped at ") + OS.str());
 }
 
 static MachineMemOperand* getMachineMemOperand(MachineFunction &MF,
